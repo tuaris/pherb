@@ -11,7 +11,7 @@ class PyannoteClient
     public function __construct(string $baseUrl = 'http://127.0.0.1:9090')
     {
         $this->http = new \EnchiladaHTTP(rtrim($baseUrl, '/'));
-        $this->http->setTimeout(300);
+        $this->http->setTimeout(900); // 15 min for long audio diarization on CPU
     }
 
     /**

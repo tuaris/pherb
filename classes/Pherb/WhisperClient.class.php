@@ -11,7 +11,7 @@ class WhisperClient
     public function __construct(string $baseUrl = 'http://127.0.0.1:8080')
     {
         $this->http = new \EnchiladaHTTP(rtrim($baseUrl, '/'));
-        $this->http->setTimeout(300); // 5 min for long audio
+        $this->http->setTimeout(900); // 15 min for long audio files
     }
 
     /**
