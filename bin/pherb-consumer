@@ -16,6 +16,8 @@ declare(ticks=1);
 require_once __DIR__ . '/../system/bootstrap.inc.php';
 
 use Enchilada\Config\IniConfig;
+use Basis\Nats\Client as NatsClient;
+use Basis\Nats\Configuration as NatsConfiguration;
 use Pherb\JobStore;
 use Pherb\WhisperClient;
 use Pherb\PyannoteClient;
@@ -263,109 +265,24 @@ class PherbConsumer
     }
 
     /**
-     * Connect to NATS and subscribe to JetStream consumer.
+     * Create and connect NATS JetStream client.
      */
-    private function natsSubscribe(): mixed
+    private function createNatsClient(): NatsClient
     {
-        $fp = @fsockopen($this->natsHost, $this->natsPort, $errno, $errstr, 10);
-        if (!$fp) {
-            throw new \RuntimeException("Cannot connect to NATS at {$this->natsHost}:{$this->natsPort}: {$errstr}");
-        }
+        $config = new NatsConfiguration(
+            host: $this->natsHost,
+            port: $this->natsPort,
+            timeout: 2.0,
+        );
 
-        stream_set_timeout($fp, 2);
+        $client = new NatsClient($config);
+        $client->setName('pherb-consumer');
+        $client->skipInvalidMessages(true);
 
-        // Read server INFO
-        $info = fgets($fp, 4096);
-        if (!str_starts_with($info, 'INFO')) {
-            fclose($fp);
-            throw new \RuntimeException("Unexpected NATS response: " . trim($info));
-        }
+        // Verify connectivity
+        $client->ping();
 
-        // CONNECT
-        fwrite($fp, "CONNECT {\"verbose\":false,\"pedantic\":false,\"name\":\"pherb-consumer\"}\r\n");
-
-        // Subscribe to the JetStream push consumer subject
-        // For a simple pull-based approach, we subscribe to pherb.jobs.transcribe
-        fwrite($fp, "SUB pherb.jobs.transcribe pherb-worker 1\r\n");
-        fwrite($fp, "PING\r\n");
-
-        $pong = fgets($fp, 64);
-        if (trim($pong) !== 'PONG') {
-            fclose($fp);
-            throw new \RuntimeException("NATS handshake failed");
-        }
-
-        return $fp;
-    }
-
-    /**
-     * Read a single message from NATS connection.
-     * Returns null on timeout, array on message.
-     */
-    private function natsReadMessage($fp): ?array
-    {
-        $line = @fgets($fp, 4096);
-        if ($line === false || trim($line) === '') {
-            return null;
-        }
-
-        $line = trim($line);
-
-        // Handle PING from server
-        if ($line === 'PING') {
-            fwrite($fp, "PONG\r\n");
-            return null;
-        }
-
-        // MSG <subject> <sid> [reply-to] <#bytes>
-        if (!str_starts_with($line, 'MSG ')) {
-            return null;
-        }
-
-        $parts = explode(' ', $line);
-        $numBytes = (int)end($parts);
-        $replyTo = (count($parts) === 5) ? $parts[3] : null;
-
-        // Read payload
-        $payload = '';
-        $remaining = $numBytes + 2; // +2 for \r\n
-        while ($remaining > 0) {
-            $chunk = fread($fp, $remaining);
-            if ($chunk === false) break;
-            $payload .= $chunk;
-            $remaining -= strlen($chunk);
-        }
-
-        $payload = trim($payload);
-        $data = json_decode($payload, true);
-
-        return [
-            'data' => $data,
-            'reply_to' => $replyTo,
-            'raw' => $payload,
-        ];
-    }
-
-    /**
-     * ACK a JetStream message.
-     */
-    private function natsAck($fp, ?string $replyTo): void
-    {
-        if ($replyTo) {
-            fwrite($fp, "PUB {$replyTo} 0\r\n\r\n");
-        }
-    }
-
-    /**
-     * NAK a JetStream message (request redelivery with delay).
-     */
-    private function natsNak($fp, ?string $replyTo, int $delaySec = 30): void
-    {
-        if ($replyTo) {
-            $nakPayload = json_encode(['-NAK' => ['delay' => $delaySec * 1_000_000_000]]);
-            $len = strlen($nakPayload);
-            fwrite($fp, "PUB {$replyTo} {$len}\r\n{$nakPayload}\r\n");
-        }
+        return $client;
     }
 
     /**
@@ -393,59 +310,97 @@ class PherbConsumer
 
         $this->jobStore = new JobStore($pdo);
 
-        // Connect to NATS
-        $fp = null;
+        // Connect to NATS JetStream
+        $client = null;
+        $queue = null;
         $reconnectDelay = 1;
 
         while ($this->daemonTick()) {
-            // Ensure NATS connection
-            if ($fp === null || feof($fp)) {
+            // Ensure NATS connection + JetStream consumer
+            if ($client === null || $queue === null) {
                 try {
-                    $fp = $this->natsSubscribe();
+                    $client = $this->createNatsClient();
+
+                    // Get or create stream + durable consumer
+                    $stream = $client->getApi()->getStream('PHERB');
+                    $stream->getConfiguration()->setSubjects(['pherb.jobs.>']);
+                    $stream->createIfNotExists();
+
+                    $consumer = $stream->getConsumer('pherb-worker');
+                    $consumerConfig = $consumer->getConfiguration();
+                    $consumerConfig->setAckWait(300_000_000_000); // 5 min in nanoseconds
+                    $consumerConfig->setMaxDeliver(3);
+                    $consumerConfig->setSubjectFilter('pherb.jobs.transcribe');
+                    $consumer->create();
+
+                    // Set up pull queue
+                    $consumer->setExpires(2.0);
+                    $consumer->setBatching(1);
+                    $queue = $consumer->getQueue();
+
                     $reconnectDelay = 1;
-                    echo "Connected to NATS, waiting for jobs...\n\n";
+                    echo "Connected to NATS JetStream, waiting for jobs...\n\n";
                 } catch (\Throwable $e) {
                     $this->logDaemon("NATS connect failed: " . $e->getMessage() . " (retry in {$reconnectDelay}s)");
+                    $client = null;
+                    $queue = null;
                     sleep(min($reconnectDelay, 30));
                     $reconnectDelay *= 2;
                     continue;
                 }
             }
 
-            // Read message
-            $msg = $this->natsReadMessage($fp);
-            if ($msg === null) {
-                continue;
-            }
-
-            $data = $msg['data'];
-            if (!$data || empty($data['job_id'])) {
-                $this->logDaemon("Invalid message received: " . substr($msg['raw'], 0, 200));
-                $this->natsAck($fp, $msg['reply_to']);
-                continue;
-            }
-
-            $jobId = $data['job_id'];
-            $audioPath = $data['audio_path'] ?? '';
-            $options = $data['options'] ?? [];
-
+            // Pull messages from JetStream consumer
             try {
-                $this->jobStore->markProcessing($jobId);
-                $this->processJob($jobId, $audioPath, $options);
-                $this->natsAck($fp, $msg['reply_to']);
-                $this->incrementMetric('processed');
-                echo "[" . date('H:i:s') . "] Job {$jobId} completed\n";
+                $messages = $queue->fetchAll(1);
             } catch (\Throwable $e) {
-                $this->logDaemon("[{$jobId}] FAILED: " . $e->getMessage());
-                $this->jobStore->markFailed($jobId, $e->getMessage());
-                $this->natsNak($fp, $msg['reply_to'], 30);
-                $this->incrementMetric('errors');
+                $this->logDaemon("NATS fetch error: " . $e->getMessage() . " (reconnecting)");
+                $client = null;
+                $queue = null;
+                continue;
             }
 
-            $this->recordActivity();
+            if (empty($messages)) {
+                continue;
+            }
+
+            foreach ($messages as $message) {
+                $payload = $message->payload;
+                if ($payload->isEmpty()) {
+                    continue;
+                }
+
+                $data = json_decode($payload->body, true);
+                if (!$data || empty($data['job_id'])) {
+                    $this->logDaemon("Invalid message received: " . substr($payload->body, 0, 200));
+                    $message->ack();
+                    continue;
+                }
+
+                $jobId = $data['job_id'];
+                $audioPath = $data['audio_path'] ?? '';
+                $options = $data['options'] ?? [];
+
+                try {
+                    $this->jobStore->markProcessing($jobId);
+                    $this->processJob($jobId, $audioPath, $options);
+                    $message->ack();
+                    $this->incrementMetric('processed');
+                    echo "[" . date('H:i:s') . "] Job {$jobId} completed\n";
+                } catch (\Throwable $e) {
+                    $this->logDaemon("[{$jobId}] FAILED: " . $e->getMessage());
+                    $this->jobStore->markFailed($jobId, $e->getMessage());
+                    $message->nack(30.0); // retry after 30 seconds
+                    $this->incrementMetric('errors');
+                }
+
+                $this->recordActivity();
+            }
         }
 
-        if ($fp) fclose($fp);
+        if ($client) {
+            try { $client->disconnect(); } catch (\Throwable $e) {}
+        }
         $this->cleanupDaemon();
         return 0;
     }

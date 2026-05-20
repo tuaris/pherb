@@ -77,21 +77,15 @@ $api->post('/jobs', function($req, $res) use ($jobStore, $natsHost, $natsPort, $
             'options' => $options,
         ]);
 
-        $fp = @fsockopen($natsHost, (int)$natsPort, $errno, $errstr, 5);
-        if ($fp) {
-            // Read INFO
-            fgets($fp, 4096);
-            // Send CONNECT
-            fwrite($fp, "CONNECT {}\r\n");
-            // Publish to JetStream subject
-            $subject = 'pherb.jobs.transcribe';
-            $len = strlen($natsPayload);
-            fwrite($fp, "PUB {$subject} {$len}\r\n{$natsPayload}\r\n");
-            fwrite($fp, "PING\r\n");
-            $pong = fgets($fp, 64);
-            $published = (trim($pong) === 'PONG' || trim($pong) === '+OK');
-            fclose($fp);
-        }
+        $natsConfig = new \Basis\Nats\Configuration(
+            host: $natsHost,
+            port: (int)$natsPort,
+            timeout: 5.0,
+        );
+        $natsClient = new \Basis\Nats\Client($natsConfig);
+        $natsClient->publish('pherb.jobs.transcribe', $natsPayload);
+        $natsClient->disconnect();
+        $published = true;
     } catch (\Throwable $e) {
         // NATS publish failed — job is in DB, consumer will pick up on retry
     }
