@@ -32,7 +32,7 @@ $audioBasePath = getenv('PHERB_AUDIO_PATH') ?: ($SETTINGS ? $SETTINGS->getString
 
 // --- API Router ---
 
-$api = new \EnchiladaREST('/api/v1');
+$api = new \EnchiladaREST\EnchiladaREST('/api/v1');
 $api->enableCors(['origins' => '*']);
 
 // Health check

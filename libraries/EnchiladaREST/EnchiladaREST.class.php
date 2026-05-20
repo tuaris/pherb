@@ -1,4 +1,5 @@
 <?php
+namespace EnchiladaREST;
 
 /* Enchilada Framework 3.0 
  * REST API Server/Router
