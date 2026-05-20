@@ -90,6 +90,49 @@ class JobStore
     }
 
     /**
+     * Clean up old completed/failed jobs beyond the retention period.
+     * Returns the list of deleted job IDs and removes output files from disk.
+     */
+    public function cleanup(int $ttlDays = 7, ?string $outputPath = null): array
+    {
+        // Find expired jobs
+        $stmt = $this->db->prepare(
+            "SELECT id, result_path FROM jobs
+             WHERE status IN ('completed', 'failed')
+             AND completed_at < DATE_SUB(NOW(), INTERVAL :ttl DAY)"
+        );
+        $stmt->execute(['ttl' => $ttlDays]);
+        $expired = $stmt->fetchAll(\PDO::FETCH_ASSOC);
+
+        if (empty($expired)) {
+            return [];
+        }
+
+        $deletedIds = [];
+        foreach ($expired as $row) {
+            // Remove output file if it exists
+            if (!empty($row['result_path'])) {
+                $filePath = $row['result_path'];
+                // If result_path is relative, prepend outputPath
+                if ($outputPath && !str_starts_with($filePath, '/')) {
+                    $filePath = rtrim($outputPath, '/') . '/' . $filePath;
+                }
+                if (is_file($filePath)) {
+                    @unlink($filePath);
+                }
+            }
+            $deletedIds[] = $row['id'];
+        }
+
+        // Delete the DB records
+        $placeholders = implode(',', array_fill(0, count($deletedIds), '?'));
+        $stmt = $this->db->prepare("DELETE FROM jobs WHERE id IN ({$placeholders})");
+        $stmt->execute($deletedIds);
+
+        return $deletedIds;
+    }
+
+    /**
      * List recent jobs.
      */
     public function listRecent(int $limit = 50, ?string $status = null): array
