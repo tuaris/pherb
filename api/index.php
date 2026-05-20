@@ -44,6 +44,75 @@ $api->get('/health', function($req, $res) {
     ]);
 });
 
+// Prometheus metrics
+$api->get('/metrics', function($req, $res) use ($jobStore) {
+    $counts = $jobStore->getStatusCounts();
+    $avgDuration = $jobStore->getAvgDuration();
+    $total = array_sum($counts);
+
+    $lines = [];
+
+    // Job gauges by status
+    $lines[] = '# HELP pherb_jobs_total Current number of jobs by status';
+    $lines[] = '# TYPE pherb_jobs_total gauge';
+    foreach ($counts as $status => $count) {
+        $lines[] = "pherb_jobs_total{status=\"{$status}\"} {$count}";
+    }
+
+    $lines[] = '# HELP pherb_jobs_count Total jobs in database';
+    $lines[] = '# TYPE pherb_jobs_count gauge';
+    $lines[] = "pherb_jobs_count {$total}";
+
+    $lines[] = '# HELP pherb_job_duration_avg_seconds Average processing duration (last 24h)';
+    $lines[] = '# TYPE pherb_job_duration_avg_seconds gauge';
+    $lines[] = "pherb_job_duration_avg_seconds {$avgDuration}";
+
+    // Consumer daemon metrics (from health file)
+    $healthFile = getenv('HEALTH_FILE') ?: '/var/run/pherb-consumer.health';
+    $consumerUp = 0;
+    if (is_file($healthFile)) {
+        $health = json_decode(file_get_contents($healthFile), true);
+        if ($health && ($health['status'] ?? '') === 'running') {
+            // Consider consumer up if health file updated within last 120 seconds
+            $updatedAt = strtotime($health['updated_at'] ?? '');
+            if ($updatedAt && (time() - $updatedAt) < 120) {
+                $consumerUp = 1;
+            }
+        }
+
+        if ($health) {
+            $processed = $health['metrics']['processed'] ?? 0;
+            $errors = $health['metrics']['errors'] ?? 0;
+            $memMb = $health['memory_mb'] ?? 0;
+            $memPeakMb = $health['memory_peak_mb'] ?? 0;
+
+            $lines[] = '# HELP pherb_consumer_processed_total Total jobs processed by consumer';
+            $lines[] = '# TYPE pherb_consumer_processed_total counter';
+            $lines[] = "pherb_consumer_processed_total {$processed}";
+
+            $lines[] = '# HELP pherb_consumer_errors_total Total consumer errors';
+            $lines[] = '# TYPE pherb_consumer_errors_total counter';
+            $lines[] = "pherb_consumer_errors_total {$errors}";
+
+            $lines[] = '# HELP pherb_consumer_memory_megabytes Consumer memory usage';
+            $lines[] = '# TYPE pherb_consumer_memory_megabytes gauge';
+            $lines[] = "pherb_consumer_memory_megabytes {$memMb}";
+
+            $lines[] = '# HELP pherb_consumer_memory_peak_megabytes Consumer peak memory';
+            $lines[] = '# TYPE pherb_consumer_memory_peak_megabytes gauge';
+            $lines[] = "pherb_consumer_memory_peak_megabytes {$memPeakMb}";
+        }
+    }
+
+    $lines[] = '# HELP pherb_consumer_up Consumer daemon is running';
+    $lines[] = '# TYPE pherb_consumer_up gauge';
+    $lines[] = "pherb_consumer_up {$consumerUp}";
+
+    header('Content-Type: text/plain; version=0.0.4; charset=utf-8');
+    echo implode("\n", $lines) . "\n";
+    exit;
+});
+
 // Submit a new transcription job
 $api->post('/jobs', function($req, $res) use ($jobStore, $natsHost, $natsPort, $audioBasePath) {
     $body = $req->getJsonBody() ?? [];

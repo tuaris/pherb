@@ -133,6 +133,37 @@ class JobStore
     }
 
     /**
+     * Get job counts grouped by status for metrics.
+     */
+    public function getStatusCounts(): array
+    {
+        $stmt = $this->db->query(
+            "SELECT status, COUNT(*) as count FROM jobs GROUP BY status"
+        );
+        $counts = ['queued' => 0, 'processing' => 0, 'completed' => 0, 'failed' => 0];
+        foreach ($stmt->fetchAll(\PDO::FETCH_ASSOC) as $row) {
+            $counts[$row['status']] = (int)$row['count'];
+        }
+        return $counts;
+    }
+
+    /**
+     * Get average processing duration for completed jobs (last 24h).
+     */
+    public function getAvgDuration(): float
+    {
+        $stmt = $this->db->query(
+            "SELECT AVG(TIMESTAMPDIFF(SECOND, started_at, completed_at)) as avg_sec
+             FROM jobs
+             WHERE status = 'completed'
+             AND completed_at > DATE_SUB(NOW(), INTERVAL 1 DAY)
+             AND started_at IS NOT NULL"
+        );
+        $row = $stmt->fetch(\PDO::FETCH_ASSOC);
+        return (float)($row['avg_sec'] ?? 0);
+    }
+
+    /**
      * List recent jobs.
      */
     public function listRecent(int $limit = 50, ?string $status = null): array
