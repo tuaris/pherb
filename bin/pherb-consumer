@@ -62,11 +62,11 @@ class PherbConsumer
 
         // NATS
         $this->natsHost = getenv('NATS_HOST') ?: ($settings ? $settings->getString('nats', 'host', '127.0.0.1') : '127.0.0.1');
-        $this->natsPort = (int)(getenv('NATS_PORT') ?: ($settings ? $settings->getString('nats', 'port', '4222') : '4222'));
+        $this->natsPort = (int)(getenv('NATS_PORT') ?: ($settings ? $settings->getInt('nats', 'port', 4222) : 4222));
 
         // Cleanup
-        $this->cleanupTtlDays = (int)(getenv('CLEANUP_TTL_DAYS') ?: ($settings ? $settings->getString('cleanup', 'ttl_days', '7') : '7'));
-        $this->cleanupIntervalMin = (int)(getenv('CLEANUP_INTERVAL_MIN') ?: ($settings ? $settings->getString('cleanup', 'interval_minutes', '60') : '60'));
+        $this->cleanupTtlDays = (int)(getenv('CLEANUP_TTL_DAYS') ?: ($settings ? $settings->getInt('cleanup', 'ttl_days', 7) : 7));
+        $this->cleanupIntervalMin = (int)(getenv('CLEANUP_INTERVAL_MIN') ?: ($settings ? $settings->getInt('cleanup', 'interval_minutes', 60) : 60));
 
         // Initialize service clients
         $this->whisper = new WhisperClient($whisperUrl);

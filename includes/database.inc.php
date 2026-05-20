@@ -16,7 +16,7 @@ use Enchilada\Config\IniConfig;
 function pherb_create_mariadb(?IniConfig $settings = null): PDO
 {
     $host = getenv('PHERB_DB_HOST') ?: ($settings ? $settings->getString('mariadb', 'host', '127.0.0.1') : '127.0.0.1');
-    $port = getenv('PHERB_DB_PORT') ?: ($settings ? $settings->getString('mariadb', 'port', '3306') : '3306');
+    $port = getenv('PHERB_DB_PORT') ?: ($settings ? $settings->getInt('mariadb', 'port', 3306) : 3306);
     $dbname = getenv('PHERB_DB_NAME') ?: ($settings ? $settings->getString('mariadb', 'database', 'pherb') : 'pherb');
     $user = getenv('PHERB_DB_USER') ?: ($settings ? $settings->getString('mariadb', 'username', 'pherb') : 'pherb');
     $pass = getenv('PHERB_DB_PASS') ?: ($settings ? $settings->getString('mariadb', 'password', '') : '');

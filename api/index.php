@@ -25,7 +25,7 @@ $jobStore = new JobStore($pdo);
 
 // NATS connection info for publishing
 $natsHost = getenv('NATS_HOST') ?: ($SETTINGS ? $SETTINGS->getString('nats', 'host', '127.0.0.1') : '127.0.0.1');
-$natsPort = getenv('NATS_PORT') ?: ($SETTINGS ? $SETTINGS->getString('nats', 'port', '4222') : '4222');
+$natsPort = getenv('NATS_PORT') ?: ($SETTINGS ? $SETTINGS->getInt('nats', 'port', 4222) : 4222);
 
 // Audio storage base path
 $audioBasePath = getenv('PHERB_AUDIO_PATH') ?: ($SETTINGS ? $SETTINGS->getString('storage', 'audio_path', '/data/audio') : '/data/audio');
