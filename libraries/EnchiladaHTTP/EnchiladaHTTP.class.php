@@ -145,6 +145,8 @@ class EnchiladaHTTP {
 		if (!$hasContentType && $method != 'GET') {
 			if ($format === 'json') {
 				$headers[] = self::CONTENT_TYPE_JSON;
+			} elseif ($format === 'multipart') {
+				// Let cURL set Content-Type with boundary automatically
 			} elseif (is_array($data)) {
 				$headers[] = self::CONTENT_TYPE_FORM_ENCODED;
 			}
@@ -214,6 +216,9 @@ class EnchiladaHTTP {
 		if (is_array($data)) {
 			if ($format == 'json') {
 				$payload = json_encode($data);
+			} elseif ($format == 'multipart') {
+				// Pass array as-is for cURL multipart/form-data (supports CURLFile)
+				$payload = $data;
 			} else {
 				$payload = http_build_query($data);
 			}
