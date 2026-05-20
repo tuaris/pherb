@@ -1,5 +1,6 @@
 const std = @import("std");
 const nats = @import("nats");
+const zio = @import("zio");
 
 const log = std.log.scoped(.whisper_worker);
 
@@ -25,6 +26,10 @@ pub fn main() !void {
     log.info("subject: {s}", .{config.subject});
     log.info("whisper-cli: {s}", .{config.whisper_bin});
     log.info("models: {s}", .{config.models_dir});
+
+    // Initialize ZIO runtime (kqueue on FreeBSD)
+    const rt = try zio.Runtime.init(allocator, .{});
+    defer rt.deinit();
 
     // Connect to NATS
     var conn = nats.Connection.init(allocator, .{});
@@ -111,11 +116,45 @@ fn handleMessage(
     var threads_buf: [4]u8 = undefined;
     const threads_str = std.fmt.bufPrint(&threads_buf, "{d}", .{config.threads}) catch unreachable;
 
+    // Convert to WAV (16kHz mono) if not already WAV
+    var wav_path_buf: [512]u8 = undefined;
+    var needs_cleanup_wav = false;
+    const wav_path = blk: {
+        if (std.mem.endsWith(u8, audio_path, ".wav")) {
+            break :blk audio_path;
+        }
+        const wp = std.fmt.bufPrint(&wav_path_buf, "/tmp/pherb_wav_{s}.wav", .{job_id}) catch unreachable;
+        log.info("[{s}] converting to WAV...", .{job_id});
+        var ffmpeg = std.process.Child.init(&.{
+            "/usr/local/bin/ffmpeg", "-y", "-i", audio_path,
+            "-ar", "16000", "-ac", "1", wp,
+        }, allocator);
+        ffmpeg.stderr_behavior = .Ignore;
+        ffmpeg.stdout_behavior = .Ignore;
+        ffmpeg.spawn() catch |err| {
+            log.err("[{s}] ffmpeg spawn failed: {}", .{ job_id, err });
+            try conn.publish(reply_to, "{\"error\":\"ffmpeg spawn failed\"}");
+            return;
+        };
+        const ff_result = ffmpeg.wait() catch |err| {
+            log.err("[{s}] ffmpeg wait failed: {}", .{ job_id, err });
+            try conn.publish(reply_to, "{\"error\":\"ffmpeg wait failed\"}");
+            return;
+        };
+        if (ff_result.Exited != 0) {
+            log.err("[{s}] ffmpeg exited with code {d}", .{ job_id, ff_result.Exited });
+            try conn.publish(reply_to, "{\"error\":\"ffmpeg conversion failed\"}");
+            return;
+        }
+        needs_cleanup_wav = true;
+        break :blk wp;
+    };
+
     // Run whisper-cli
     var child = std.process.Child.init(&.{
         config.whisper_bin,
         "-m",  model_path,
-        "-f",  audio_path,
+        "-f",  wav_path,
         "-t",  threads_str,
         "--output-json-full",
         "-of", out_base,
@@ -128,14 +167,19 @@ fn handleMessage(
         var err_buf: [256]u8 = undefined;
         const err_msg = std.fmt.bufPrint(&err_buf, "{{\"error\":\"spawn failed: {s}\"}}", .{@errorName(err)}) catch unreachable;
         try conn.publish(reply_to, err_msg);
+        if (needs_cleanup_wav) std.fs.cwd().deleteFile(wav_path) catch {};
         return;
     };
 
     const result = child.wait() catch |err| {
         log.err("[{s}] whisper-cli wait failed: {}", .{ job_id, err });
         try conn.publish(reply_to, "{\"error\":\"wait failed\"}");
+        if (needs_cleanup_wav) std.fs.cwd().deleteFile(wav_path) catch {};
         return;
     };
+
+    // Clean up temp WAV
+    if (needs_cleanup_wav) std.fs.cwd().deleteFile(wav_path) catch {};
 
     if (result.Exited != 0) {
         log.err("[{s}] whisper-cli exited with code {d}", .{ job_id, result.Exited });
