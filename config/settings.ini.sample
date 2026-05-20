@@ -10,6 +10,14 @@ host = 127.0.0.1
 port = 4222
 
 [whisper]
+; Backend: "cli" (default, recommended) or "http"
+; cli  — shells out to whisper-cli, no timeout, releases memory after each job
+; http — synchronous POST to whisper-server, subject to HTTP timeout
+backend = cli
+cli_path = /usr/local/bin/whisper-cli
+models_dir = /models/whisper
+threads = 8
+; Only used when backend = http
 url = http://127.0.0.1:8080
 
 [pyannote]

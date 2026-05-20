@@ -19,7 +19,9 @@ use Enchilada\Config\IniConfig;
 use Basis\Nats\Client as NatsClient;
 use Basis\Nats\Configuration as NatsConfiguration;
 use Pherb\JobStore;
+use Pherb\WhisperBackend;
 use Pherb\WhisperClient;
+use Pherb\WhisperCliBackend;
 use Pherb\PyannoteClient;
 use Pherb\Wav2vec2Client;
 use Pherb\TranscriptMerger;
@@ -33,7 +35,7 @@ class PherbConsumer
     use \Enchilada\Daemon\DaemonBehavior;
 
     private JobStore $jobStore;
-    private WhisperClient $whisper;
+    private WhisperBackend $whisper;
     private PyannoteClient $pyannote;
     private Wav2vec2Client $wav2vec2;
     private TranscriptMerger $merger;
@@ -51,8 +53,17 @@ class PherbConsumer
     {
         $this->settings = $settings;
 
+        // Whisper backend selection (cli or http)
+        $whisperBackend = getenv('WHISPER_BACKEND') ?: ($settings ? $settings->getString('whisper', 'backend', 'cli') : 'cli');
+        if ($whisperBackend === 'cli') {
+            $whisperBinary = getenv('WHISPER_CLI_PATH') ?: ($settings ? $settings->getString('whisper', 'cli_path', '/usr/local/bin/whisper-cli') : '/usr/local/bin/whisper-cli');
+            $whisperModelsDir = getenv('WHISPER_MODELS_DIR') ?: ($settings ? $settings->getString('whisper', 'models_dir', '/models/whisper') : '/models/whisper');
+            $whisperThreads = (int)(getenv('WHISPER_THREADS') ?: ($settings ? $settings->getInt('whisper', 'threads', 8) : 8));
+        } else {
+            $whisperUrl = getenv('WHISPER_URL') ?: ($settings ? $settings->getString('whisper', 'url', 'http://127.0.0.1:8080') : 'http://127.0.0.1:8080');
+        }
+
         // Service URLs
-        $whisperUrl = getenv('WHISPER_URL') ?: ($settings ? $settings->getString('whisper', 'url', 'http://127.0.0.1:8080') : 'http://127.0.0.1:8080');
         $pyannoteUrl = getenv('PYANNOTE_URL') ?: ($settings ? $settings->getString('pyannote', 'url', 'http://127.0.0.1:9090') : 'http://127.0.0.1:9090');
         $wav2vec2Url = getenv('WAV2VEC2_URL') ?: ($settings ? $settings->getString('wav2vec2', 'url', 'http://127.0.0.1:9091') : 'http://127.0.0.1:9091');
 
@@ -69,7 +80,9 @@ class PherbConsumer
         $this->cleanupIntervalMin = (int)(getenv('CLEANUP_INTERVAL_MIN') ?: ($settings ? $settings->getInt('cleanup', 'interval_minutes', 60) : 60));
 
         // Initialize service clients
-        $this->whisper = new WhisperClient($whisperUrl);
+        $this->whisper = ($whisperBackend === 'cli')
+            ? new WhisperCliBackend($whisperBinary, $whisperModelsDir, $whisperThreads)
+            : new WhisperClient($whisperUrl);
         $this->pyannote = new PyannoteClient($pyannoteUrl);
         $this->wav2vec2 = new Wav2vec2Client($wav2vec2Url);
         $this->merger = new TranscriptMerger();
@@ -299,6 +312,7 @@ class PherbConsumer
     {
         echo "Pherb Transcription Consumer\n";
         echo "============================\n";
+        echo "Whisper: " . get_class($this->whisper) . "\n";
         echo "NATS: {$this->natsHost}:{$this->natsPort}\n";
         echo "Audio: {$this->audioBasePath}\n";
         echo "Output: {$this->outputPath}\n";

@@ -3,8 +3,12 @@ namespace Pherb;
 
 /**
  * WhisperClient — Calls whisper.cpp HTTP server for transcription.
+ *
+ * Synchronous HTTP backend — sends audio to the whisper-server /inference
+ * endpoint and blocks until transcription completes. Subject to HTTP timeout
+ * limits. Prefer WhisperCliBackend for long audio files.
  */
-class WhisperClient
+class WhisperClient implements WhisperBackend
 {
     private \EnchiladaHTTP $http;
 
