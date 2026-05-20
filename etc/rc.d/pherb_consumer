@@ -1,0 +1,60 @@
+#!/bin/sh
+#
+# PROVIDE: pherb_consumer
+# REQUIRE: LOGIN nats mysql
+# KEYWORD: shutdown
+#
+# Add the following lines to /etc/rc.conf to enable pherb_consumer:
+#
+# pherb_consumer_enable="YES"
+#
+
+. /etc/rc.subr
+
+name="pherb_consumer"
+rcvar="${name}_enable"
+
+load_rc_config $name
+
+: ${pherb_consumer_enable:="NO"}
+: ${pherb_consumer_user="www"}
+
+pidfile="/var/run/${name}.pid"
+logfile="/var/log/${name}.log"
+
+procname="/usr/local/www/pherb/bin/pherb-consumer"
+command_interpreter="/usr/local/bin/php"
+command="/usr/sbin/daemon"
+command_args="-p ${pidfile} -o ${logfile} -S -T ${name} \
+    -u ${pherb_consumer_user} -- ${procname}"
+
+start_precmd="${name}_prestart"
+stop_postcmd="${name}_poststop"
+extra_commands="health"
+health_cmd="${name}_health"
+
+pherb_consumer_prestart()
+{
+    install -o ${pherb_consumer_user} -m 640 /dev/null ${logfile} 2>/dev/null || true
+
+    _health_file="/var/run/pherb-consumer.health"
+    install -o ${pherb_consumer_user} -m 640 /dev/null "${_health_file}" 2>/dev/null || true
+}
+
+pherb_consumer_poststop()
+{
+    rm -f "/var/run/pherb-consumer.health"
+}
+
+pherb_consumer_health()
+{
+    _health_file="/var/run/pherb-consumer.health"
+    if [ -f "${_health_file}" ]; then
+        cat "${_health_file}"
+    else
+        echo "No health file found at ${_health_file}"
+        return 1
+    fi
+}
+
+run_rc_command "$1"

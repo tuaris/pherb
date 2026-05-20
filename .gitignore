@@ -1,0 +1,5 @@
+config/settings.ini
+config/local.conf.php
+temp/
+*.log
+.DS_Store

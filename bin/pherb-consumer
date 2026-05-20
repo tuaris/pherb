@@ -1,0 +1,460 @@
+#!/usr/local/bin/php
+<?php
+/**
+ * Pherb — NATS JetStream Consumer Daemon
+ *
+ * Long-running process that consumes transcription jobs from NATS JetStream,
+ * orchestrates whisper/pyannote/wav2vec2 services, and stores results.
+ *
+ * @author Daniel Morante
+ * @copyright 2026 The Daniel Morante Company, Inc.
+ * @license BSD-2-Clause
+ */
+
+declare(ticks=1);
+
+require_once __DIR__ . '/../system/bootstrap.inc.php';
+
+use Enchilada\Config\IniConfig;
+use Pherb\JobStore;
+use Pherb\WhisperClient;
+use Pherb\PyannoteClient;
+use Pherb\Wav2vec2Client;
+use Pherb\TranscriptMerger;
+use Pherb\OutputFormatter;
+
+/**
+ * Pherb Job Consumer
+ */
+class PherbConsumer
+{
+    use \Enchilada\Daemon\DaemonBehavior;
+
+    private JobStore $jobStore;
+    private WhisperClient $whisper;
+    private PyannoteClient $pyannote;
+    private Wav2vec2Client $wav2vec2;
+    private TranscriptMerger $merger;
+    private OutputFormatter $formatter;
+    private string $audioBasePath;
+    private string $outputPath;
+    private string $natsHost;
+    private int $natsPort;
+    private ?IniConfig $settings;
+
+    public function __construct(?IniConfig $settings = null)
+    {
+        $this->settings = $settings;
+
+        // Service URLs
+        $whisperUrl = getenv('WHISPER_URL') ?: ($settings ? $settings->getString('whisper', 'url', 'http://127.0.0.1:8080') : 'http://127.0.0.1:8080');
+        $pyannoteUrl = getenv('PYANNOTE_URL') ?: ($settings ? $settings->getString('pyannote', 'url', 'http://127.0.0.1:9090') : 'http://127.0.0.1:9090');
+        $wav2vec2Url = getenv('WAV2VEC2_URL') ?: ($settings ? $settings->getString('wav2vec2', 'url', 'http://127.0.0.1:9091') : 'http://127.0.0.1:9091');
+
+        // Storage paths
+        $this->audioBasePath = getenv('PHERB_AUDIO_PATH') ?: ($settings ? $settings->getString('storage', 'audio_path', '/data/audio') : '/data/audio');
+        $this->outputPath = getenv('PHERB_OUTPUT_PATH') ?: ($settings ? $settings->getString('storage', 'output_path', '/data/audio/outputs') : '/data/audio/outputs');
+
+        // NATS
+        $this->natsHost = getenv('NATS_HOST') ?: ($settings ? $settings->getString('nats', 'host', '127.0.0.1') : '127.0.0.1');
+        $this->natsPort = (int)(getenv('NATS_PORT') ?: ($settings ? $settings->getString('nats', 'port', '4222') : '4222'));
+
+        // Initialize service clients
+        $this->whisper = new WhisperClient($whisperUrl);
+        $this->pyannote = new PyannoteClient($pyannoteUrl);
+        $this->wav2vec2 = new Wav2vec2Client($wav2vec2Url);
+        $this->merger = new TranscriptMerger();
+        $this->formatter = new OutputFormatter();
+
+        // Initialize daemon behavior
+        $this->initDaemon([
+            'health_file' => getenv('HEALTH_FILE') ?: '/var/run/pherb-consumer.health',
+            'max_memory_mb' => (int)(getenv('MAX_MEMORY_MB') ?: 256),
+        ]);
+    }
+
+    /**
+     * Process a single transcription job.
+     */
+    private function processJob(string $jobId, string $audioPath, array $options): void
+    {
+        $fullPath = $this->audioBasePath . '/' . ltrim($audioPath, '/');
+        $model = $options['model'] ?? 'medium.en';
+        $diarize = (bool)($options['diarize'] ?? true);
+        $align = (bool)($options['align'] ?? false);
+        $format = $options['format'] ?? 'json';
+
+        $this->logDaemon("Processing job {$jobId}: {$audioPath} (model={$model}, diarize={$diarize}, align={$align}, format={$format})");
+
+        if (!file_exists($fullPath)) {
+            throw new \RuntimeException("Audio file not found: {$fullPath}");
+        }
+
+        // Step 1: Transcribe with Whisper
+        $this->logDaemon("[{$jobId}] Calling whisper...");
+        $whisperResult = $this->whisper->transcribe($fullPath, $model);
+        $this->logDaemon("[{$jobId}] Whisper complete: " . count($whisperResult['segments'] ?? []) . " segments");
+
+        // Step 2: Speaker diarization (optional)
+        $speakerSegments = [];
+        if ($diarize) {
+            $this->logDaemon("[{$jobId}] Calling pyannote...");
+            $speakerSegments = $this->pyannote->diarize($fullPath);
+            $this->logDaemon("[{$jobId}] Pyannote complete: " . count($speakerSegments) . " speaker segments");
+        }
+
+        // Step 3: Forced alignment (optional)
+        if ($align) {
+            $this->logDaemon("[{$jobId}] Calling wav2vec2 for alignment...");
+            $words = $this->extractWordsForAlignment($whisperResult);
+            $alignedWords = $this->wav2vec2->align($fullPath, $words);
+            $whisperResult = $this->applyAlignment($whisperResult, $alignedWords);
+            $this->logDaemon("[{$jobId}] Alignment complete");
+        }
+
+        // Step 4: Merge transcript with speaker info
+        $segments = $diarize
+            ? $this->merger->merge($whisperResult, $speakerSegments)
+            : $this->segmentsWithoutDiarization($whisperResult);
+
+        // Step 5: Format output
+        $outputContent = match ($format) {
+            'srt' => $this->formatter->toSrt($segments),
+            'vtt' => $this->formatter->toVtt($segments),
+            default => $this->formatter->toJson($segments, [
+                'job_id' => $jobId,
+                'audio' => $audioPath,
+                'model' => $model,
+                'duration_seconds' => $this->estimateDuration($segments),
+            ]),
+        };
+
+        // Step 6: Write output file
+        $ext = match ($format) {
+            'srt' => 'srt',
+            'vtt' => 'vtt',
+            default => 'json',
+        };
+
+        if (!is_dir($this->outputPath)) {
+            @mkdir($this->outputPath, 0755, true);
+        }
+
+        $outputFile = $this->outputPath . "/{$jobId}.{$ext}";
+        file_put_contents($outputFile, $outputContent);
+
+        $this->logDaemon("[{$jobId}] Output written: {$outputFile}");
+
+        // Update job status
+        $this->jobStore->markCompleted($jobId, $outputFile);
+
+        // Step 7: Webhook callback
+        $job = $this->jobStore->get($jobId);
+        if (!empty($job['callback_url'])) {
+            $this->sendCallback($job['callback_url'], $job);
+        }
+    }
+
+    /**
+     * Convert Whisper result to segments without diarization (single speaker).
+     */
+    private function segmentsWithoutDiarization(array $whisperResult): array
+    {
+        $segments = [];
+        foreach ($whisperResult['segments'] ?? [] as $seg) {
+            $words = [];
+            foreach ($seg['words'] ?? [] as $w) {
+                $words[] = [
+                    'word' => trim($w['word'] ?? $w['text'] ?? ''),
+                    'start' => (float)($w['start'] ?? 0),
+                    'end' => (float)($w['end'] ?? 0),
+                    'probability' => (float)($w['probability'] ?? $w['confidence'] ?? 0),
+                    'speaker' => 'SPEAKER_00',
+                ];
+            }
+            $segments[] = [
+                'start' => (float)($seg['start'] ?? 0),
+                'end' => (float)($seg['end'] ?? 0),
+                'speaker' => 'SPEAKER_00',
+                'text' => $seg['text'] ?? '',
+                'words' => $words,
+            ];
+        }
+        return $segments;
+    }
+
+    /**
+     * Extract words for alignment service.
+     */
+    private function extractWordsForAlignment(array $whisperResult): array
+    {
+        $words = [];
+        foreach ($whisperResult['segments'] ?? [] as $seg) {
+            foreach ($seg['words'] ?? [] as $w) {
+                $words[] = [
+                    'word' => trim($w['word'] ?? $w['text'] ?? ''),
+                    'start' => (float)($w['start'] ?? 0),
+                    'end' => (float)($w['end'] ?? 0),
+                ];
+            }
+        }
+        return $words;
+    }
+
+    /**
+     * Apply alignment results back to whisper output.
+     */
+    private function applyAlignment(array $whisperResult, array $alignedWords): array
+    {
+        $alignIndex = 0;
+        foreach ($whisperResult['segments'] as &$seg) {
+            foreach ($seg['words'] as &$w) {
+                if (isset($alignedWords[$alignIndex])) {
+                    $w['start'] = $alignedWords[$alignIndex]['start'] ?? $w['start'];
+                    $w['end'] = $alignedWords[$alignIndex]['end'] ?? $w['end'];
+                }
+                $alignIndex++;
+            }
+        }
+        return $whisperResult;
+    }
+
+    /**
+     * Estimate total audio duration from segments.
+     */
+    private function estimateDuration(array $segments): float
+    {
+        if (empty($segments)) return 0.0;
+        $last = end($segments);
+        return (float)($last['end'] ?? 0);
+    }
+
+    /**
+     * Send webhook callback.
+     */
+    private function sendCallback(string $url, array $job): void
+    {
+        $payload = json_encode([
+            'job_id' => $job['id'],
+            'status' => $job['status'],
+            'result_path' => $job['result_path'],
+            'completed_at' => $job['completed_at'],
+        ]);
+
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_POST => true,
+            CURLOPT_POSTFIELDS => $payload,
+            CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT => 10,
+            CURLOPT_USERAGENT => APPLICATION_USERAGENT,
+        ]);
+
+        $response = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        if ($httpCode >= 200 && $httpCode < 300) {
+            $this->logDaemon("[{$job['id']}] Callback sent to {$url}: HTTP {$httpCode}");
+        } else {
+            $this->logDaemon("[{$job['id']}] Callback failed to {$url}: HTTP {$httpCode}");
+        }
+    }
+
+    /**
+     * Connect to NATS and subscribe to JetStream consumer.
+     */
+    private function natsSubscribe(): mixed
+    {
+        $fp = @fsockopen($this->natsHost, $this->natsPort, $errno, $errstr, 10);
+        if (!$fp) {
+            throw new \RuntimeException("Cannot connect to NATS at {$this->natsHost}:{$this->natsPort}: {$errstr}");
+        }
+
+        stream_set_timeout($fp, 2);
+
+        // Read server INFO
+        $info = fgets($fp, 4096);
+        if (!str_starts_with($info, 'INFO')) {
+            fclose($fp);
+            throw new \RuntimeException("Unexpected NATS response: " . trim($info));
+        }
+
+        // CONNECT
+        fwrite($fp, "CONNECT {\"verbose\":false,\"pedantic\":false,\"name\":\"pherb-consumer\"}\r\n");
+
+        // Subscribe to the JetStream push consumer subject
+        // For a simple pull-based approach, we subscribe to pherb.jobs.transcribe
+        fwrite($fp, "SUB pherb.jobs.transcribe pherb-worker 1\r\n");
+        fwrite($fp, "PING\r\n");
+
+        $pong = fgets($fp, 64);
+        if (trim($pong) !== 'PONG') {
+            fclose($fp);
+            throw new \RuntimeException("NATS handshake failed");
+        }
+
+        return $fp;
+    }
+
+    /**
+     * Read a single message from NATS connection.
+     * Returns null on timeout, array on message.
+     */
+    private function natsReadMessage($fp): ?array
+    {
+        $line = @fgets($fp, 4096);
+        if ($line === false || trim($line) === '') {
+            return null;
+        }
+
+        $line = trim($line);
+
+        // Handle PING from server
+        if ($line === 'PING') {
+            fwrite($fp, "PONG\r\n");
+            return null;
+        }
+
+        // MSG <subject> <sid> [reply-to] <#bytes>
+        if (!str_starts_with($line, 'MSG ')) {
+            return null;
+        }
+
+        $parts = explode(' ', $line);
+        $numBytes = (int)end($parts);
+        $replyTo = (count($parts) === 5) ? $parts[3] : null;
+
+        // Read payload
+        $payload = '';
+        $remaining = $numBytes + 2; // +2 for \r\n
+        while ($remaining > 0) {
+            $chunk = fread($fp, $remaining);
+            if ($chunk === false) break;
+            $payload .= $chunk;
+            $remaining -= strlen($chunk);
+        }
+
+        $payload = trim($payload);
+        $data = json_decode($payload, true);
+
+        return [
+            'data' => $data,
+            'reply_to' => $replyTo,
+            'raw' => $payload,
+        ];
+    }
+
+    /**
+     * ACK a JetStream message.
+     */
+    private function natsAck($fp, ?string $replyTo): void
+    {
+        if ($replyTo) {
+            fwrite($fp, "PUB {$replyTo} 0\r\n\r\n");
+        }
+    }
+
+    /**
+     * NAK a JetStream message (request redelivery with delay).
+     */
+    private function natsNak($fp, ?string $replyTo, int $delaySec = 30): void
+    {
+        if ($replyTo) {
+            $nakPayload = json_encode(['-NAK' => ['delay' => $delaySec * 1_000_000_000]]);
+            $len = strlen($nakPayload);
+            fwrite($fp, "PUB {$replyTo} {$len}\r\n{$nakPayload}\r\n");
+        }
+    }
+
+    /**
+     * Main run loop.
+     */
+    public function run(): int
+    {
+        echo "Pherb Transcription Consumer\n";
+        echo "============================\n";
+        echo "NATS: {$this->natsHost}:{$this->natsPort}\n";
+        echo "Audio: {$this->audioBasePath}\n";
+        echo "Output: {$this->outputPath}\n";
+        echo "PID: " . getmypid() . "\n\n";
+
+        // Auto-migrate database
+        $pdo = pherb_create_mariadb($this->settings);
+        $schemaDir = APPLICATION_ROOT . 'schema';
+        $runner = new \Enchilada\SQL\MigrationRunner($pdo, $schemaDir);
+        $result = $runner->applyPending();
+        if (!empty($result['applied'])) {
+            foreach ($result['applied'] as $name) {
+                echo "Migration applied: {$name}\n";
+            }
+        }
+
+        $this->jobStore = new JobStore($pdo);
+
+        // Connect to NATS
+        $fp = null;
+        $reconnectDelay = 1;
+
+        while ($this->daemonTick()) {
+            // Ensure NATS connection
+            if ($fp === null || feof($fp)) {
+                try {
+                    $fp = $this->natsSubscribe();
+                    $reconnectDelay = 1;
+                    echo "Connected to NATS, waiting for jobs...\n\n";
+                } catch (\Throwable $e) {
+                    $this->logDaemon("NATS connect failed: " . $e->getMessage() . " (retry in {$reconnectDelay}s)");
+                    sleep(min($reconnectDelay, 30));
+                    $reconnectDelay *= 2;
+                    continue;
+                }
+            }
+
+            // Read message
+            $msg = $this->natsReadMessage($fp);
+            if ($msg === null) {
+                continue;
+            }
+
+            $data = $msg['data'];
+            if (!$data || empty($data['job_id'])) {
+                $this->logDaemon("Invalid message received: " . substr($msg['raw'], 0, 200));
+                $this->natsAck($fp, $msg['reply_to']);
+                continue;
+            }
+
+            $jobId = $data['job_id'];
+            $audioPath = $data['audio_path'] ?? '';
+            $options = $data['options'] ?? [];
+
+            try {
+                $this->jobStore->markProcessing($jobId);
+                $this->processJob($jobId, $audioPath, $options);
+                $this->natsAck($fp, $msg['reply_to']);
+                $this->incrementMetric('processed');
+                echo "[" . date('H:i:s') . "] Job {$jobId} completed\n";
+            } catch (\Throwable $e) {
+                $this->logDaemon("[{$jobId}] FAILED: " . $e->getMessage());
+                $this->jobStore->markFailed($jobId, $e->getMessage());
+                $this->natsNak($fp, $msg['reply_to'], 30);
+                $this->incrementMetric('errors');
+            }
+
+            $this->recordActivity();
+        }
+
+        if ($fp) fclose($fp);
+        $this->cleanupDaemon();
+        return 0;
+    }
+}
+
+// --- Main ---
+
+/** @var IniConfig|null $SETTINGS */
+global $SETTINGS;
+
+$consumer = new PherbConsumer($SETTINGS);
+exit($consumer->run());

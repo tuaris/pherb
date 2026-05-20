@@ -1,0 +1,190 @@
+openapi: '3.0.3'
+info:
+  title: Pherb API
+  description: Speech processing orchestrator REST API
+  version: 0.1.0
+  license:
+    name: BSD-2-Clause
+
+servers:
+  - url: http://localhost:8082/api/v1
+    description: Local development
+
+paths:
+  /health:
+    get:
+      summary: Health check
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  version:
+                    type: string
+                  timestamp:
+                    type: string
+                    format: date-time
+
+  /jobs:
+    post:
+      summary: Submit a transcription job
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [audio]
+              properties:
+                audio:
+                  type: string
+                  description: Filename relative to audio storage root
+                  example: meeting-2026-05-19.wav
+                options:
+                  type: object
+                  properties:
+                    model:
+                      type: string
+                      default: medium.en
+                      description: Whisper model name
+                    diarize:
+                      type: boolean
+                      default: true
+                      description: Enable speaker diarization
+                    align:
+                      type: boolean
+                      default: false
+                      description: Enable forced word alignment
+                    format:
+                      type: string
+                      enum: [json, srt, vtt]
+                      default: json
+                callback_url:
+                  type: string
+                  format: uri
+                  description: Optional webhook URL for completion notification
+      responses:
+        '202':
+          description: Job accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  job_id:
+                    type: string
+                  status:
+                    type: string
+                    example: queued
+                  poll_url:
+                    type: string
+                  nats_published:
+                    type: boolean
+        '400':
+          description: Missing required fields
+        '404':
+          description: Audio file not found
+
+    get:
+      summary: List recent jobs
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+            maximum: 100
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [queued, processing, completed, failed]
+      responses:
+        '200':
+          description: Job list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  jobs:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/JobSummary'
+
+  /jobs/{id}:
+    get:
+      summary: Get job status
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Job details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobDetail'
+        '404':
+          description: Job not found
+
+components:
+  schemas:
+    JobSummary:
+      type: object
+      properties:
+        id:
+          type: string
+        audio_path:
+          type: string
+        status:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        started_at:
+          type: string
+          format: date-time
+          nullable: true
+        completed_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    JobDetail:
+      type: object
+      properties:
+        job_id:
+          type: string
+        status:
+          type: string
+        audio_path:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        started_at:
+          type: string
+          format: date-time
+          nullable: true
+        completed_at:
+          type: string
+          format: date-time
+          nullable: true
+        result_url:
+          type: string
+          nullable: true
+        error:
+          type: string
+          nullable: true
+        format:
+          type: string
