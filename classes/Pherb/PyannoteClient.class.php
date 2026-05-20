@@ -41,6 +41,10 @@ class PyannoteClient
             throw new \RuntimeException("Pyannote returned HTTP {$httpCode}");
         }
 
-        return $result['segments'] ?? $result;
+        $decoded = is_array($result) ? $result : json_decode($result, true);
+        if (!is_array($decoded)) {
+            throw new \RuntimeException("Pyannote returned invalid JSON");
+        }
+        return $decoded['segments'] ?? $decoded;
     }
 }

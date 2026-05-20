@@ -1,13 +1,13 @@
 [mariadb]
 host = 127.0.0.1
-port = 3306
+port = "3306"
 database = pherb
 username = pherb
 password = 
 
 [nats]
 host = 127.0.0.1
-port = 4222
+port = "4222"
 
 [whisper]
 url = http://127.0.0.1:8080

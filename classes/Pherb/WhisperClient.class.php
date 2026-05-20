@@ -45,6 +45,10 @@ class WhisperClient
             throw new \RuntimeException("Whisper returned HTTP {$httpCode}");
         }
 
-        return $result;
+        $decoded = is_array($result) ? $result : json_decode($result, true);
+        if (!is_array($decoded)) {
+            throw new \RuntimeException("Whisper returned invalid JSON");
+        }
+        return $decoded;
     }
 }

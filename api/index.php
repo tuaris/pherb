@@ -46,7 +46,7 @@ $api->get('/health', function($req, $res) {
 
 // Submit a new transcription job
 $api->post('/jobs', function($req, $res) use ($jobStore, $natsHost, $natsPort, $audioBasePath) {
-    $body = $req->getBody();
+    $body = $req->getJsonBody() ?? [];
 
     if (empty($body['audio'])) {
         $res->error('Missing required field: audio', 400);

@@ -43,6 +43,10 @@ class Wav2vec2Client
             throw new \RuntimeException("Wav2vec2 returned HTTP {$httpCode}");
         }
 
-        return $result['words'] ?? $result;
+        $decoded = is_array($result) ? $result : json_decode($result, true);
+        if (!is_array($decoded)) {
+            throw new \RuntimeException("Wav2vec2 returned invalid JSON");
+        }
+        return $decoded['words'] ?? $decoded;
     }
 }

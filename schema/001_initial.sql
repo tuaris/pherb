@@ -1,5 +1,5 @@
 -- Pherb schema: initial job table
-CREATE TABLE jobs (
+CREATE TABLE IF NOT EXISTS jobs (
   id VARCHAR(32) PRIMARY KEY,
   audio_path VARCHAR(255) NOT NULL,
   status ENUM('queued','processing','completed','failed') DEFAULT 'queued',
