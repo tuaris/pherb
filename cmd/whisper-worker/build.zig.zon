@@ -1,0 +1,16 @@
+.{
+    .name = .whisper_worker,
+    .version = "0.1.1",
+    .fingerprint = 0x2df75b1be6cf50de,
+    .dependencies = .{
+        .nats = .{
+            .url = "https://github.com/lalinsky/nats.zig/archive/refs/heads/main.tar.gz",
+            .hash = "1220643a62efb98d5c7e18c92cf83b0a8146460e9cf755ed795a900db297e6a9a4b9",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

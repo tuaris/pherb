@@ -22,6 +22,7 @@ use Pherb\JobStore;
 use Pherb\WhisperBackend;
 use Pherb\WhisperClient;
 use Pherb\WhisperCliBackend;
+use Pherb\WhisperNatsBackend;
 use Pherb\PyannoteClient;
 use Pherb\Wav2vec2Client;
 use Pherb\TranscriptMerger;
@@ -53,13 +54,13 @@ class PherbConsumer
     {
         $this->settings = $settings;
 
-        // Whisper backend selection (cli or http)
-        $whisperBackend = getenv('WHISPER_BACKEND') ?: ($settings ? $settings->getString('whisper', 'backend', 'cli') : 'cli');
+        // Whisper backend selection (nats, cli, or http)
+        $whisperBackend = getenv('WHISPER_BACKEND') ?: ($settings ? $settings->getString('whisper', 'backend', 'nats') : 'nats');
         if ($whisperBackend === 'cli') {
             $whisperBinary = getenv('WHISPER_CLI_PATH') ?: ($settings ? $settings->getString('whisper', 'cli_path', '/usr/local/bin/whisper-cli') : '/usr/local/bin/whisper-cli');
             $whisperModelsDir = getenv('WHISPER_MODELS_DIR') ?: ($settings ? $settings->getString('whisper', 'models_dir', '/models/whisper') : '/models/whisper');
             $whisperThreads = (int)(getenv('WHISPER_THREADS') ?: ($settings ? $settings->getInt('whisper', 'threads', 8) : 8));
-        } else {
+        } elseif ($whisperBackend === 'http') {
             $whisperUrl = getenv('WHISPER_URL') ?: ($settings ? $settings->getString('whisper', 'url', 'http://127.0.0.1:8080') : 'http://127.0.0.1:8080');
         }
 
@@ -80,9 +81,11 @@ class PherbConsumer
         $this->cleanupIntervalMin = (int)(getenv('CLEANUP_INTERVAL_MIN') ?: ($settings ? $settings->getInt('cleanup', 'interval_minutes', 60) : 60));
 
         // Initialize service clients
-        $this->whisper = ($whisperBackend === 'cli')
-            ? new WhisperCliBackend($whisperBinary, $whisperModelsDir, $whisperThreads)
-            : new WhisperClient($whisperUrl);
+        $this->whisper = match ($whisperBackend) {
+            'cli' => new WhisperCliBackend($whisperBinary, $whisperModelsDir, $whisperThreads),
+            'http' => new WhisperClient($whisperUrl),
+            default => new WhisperNatsBackend($this->natsHost, $this->natsPort),
+        };
         $this->pyannote = new PyannoteClient($pyannoteUrl);
         $this->wav2vec2 = new Wav2vec2Client($wav2vec2Url);
         $this->merger = new TranscriptMerger();
