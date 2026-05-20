@@ -71,7 +71,7 @@ $api->get('/metrics', function($req, $res) use ($jobStore) {
     $healthFile = getenv('HEALTH_FILE') ?: '/var/run/pherb-consumer.health';
     $consumerUp = 0;
     if (is_file($healthFile)) {
-        $health = json_decode(file_get_contents($healthFile), true);
+        $health = json_decode(@file_get_contents($healthFile), true);
         if ($health && ($health['status'] ?? '') === 'running') {
             // Consider consumer up if health file updated within last 120 seconds
             $updatedAt = strtotime($health['updated_at'] ?? '');
