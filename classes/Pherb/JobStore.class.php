@@ -62,7 +62,7 @@ class JobStore
     public function markProcessing(string $id): void
     {
         $stmt = $this->db->prepare(
-            "UPDATE jobs SET status = 'processing', started_at = NOW() WHERE id = :id"
+            "UPDATE jobs SET status = 'processing', started_at = NOW() WHERE id = :id AND status = 'queued'"
         );
         $stmt->execute(['id' => $id]);
     }
@@ -87,6 +87,23 @@ class JobStore
             "UPDATE jobs SET status = 'failed', error_message = :error, completed_at = NOW() WHERE id = :id"
         );
         $stmt->execute(['id' => $id, 'error' => $errorMessage]);
+    }
+
+    /**
+     * Recover stale jobs stuck in 'processing' state (e.g., consumer crashed).
+     * Marks them as failed if they've been processing longer than the timeout.
+     *
+     * @param int $timeoutMinutes Minutes before a processing job is considered stale
+     * @return int Number of jobs recovered
+     */
+    public function recoverStaleJobs(int $timeoutMinutes = 30): int
+    {
+        $stmt = $this->db->prepare(
+            "UPDATE jobs SET status = 'failed', error_message = 'Stale: exceeded processing timeout', completed_at = NOW()
+             WHERE status = 'processing' AND started_at < DATE_SUB(NOW(), INTERVAL :timeout MINUTE)"
+        );
+        $stmt->execute(['timeout' => $timeoutMinutes]);
+        return $stmt->rowCount();
     }
 
     /**

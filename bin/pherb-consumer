@@ -421,11 +421,15 @@ class PherbConsumer
                 $this->recordActivity();
             }
 
-            // Periodic cleanup of expired jobs
+            // Periodic cleanup + stale job recovery
             $now = time();
             if (($now - $this->lastCleanupTime) >= ($this->cleanupIntervalMin * 60)) {
                 $this->lastCleanupTime = $now;
                 try {
+                    $recovered = $this->jobStore->recoverStaleJobs(30);
+                    if ($recovered > 0) {
+                        $this->logDaemon("Recovered {$recovered} stale processing job(s)");
+                    }
                     $deleted = $this->jobStore->cleanup($this->cleanupTtlDays, $this->outputPath);
                     if (!empty($deleted)) {
                         $this->logDaemon("Cleanup: purged " . count($deleted) . " expired jobs (TTL={$this->cleanupTtlDays}d)");
