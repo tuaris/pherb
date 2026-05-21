@@ -10,7 +10,7 @@ namespace Pherb;
  *
  * Requires: whisper.cpp CLI binary installed at the configured path.
  */
-class WhisperCliBackend implements WhisperBackend
+class WhisperCliBackend
 {
     private string $binaryPath;
     private string $modelsDir;

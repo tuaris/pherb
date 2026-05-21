@@ -6,23 +6,24 @@ const c = std.c;
 
 const log = std.log.scoped(.whisper_worker);
 
-pub const version = "0.2.0";
+pub const version = "0.3.0";
 
 const Config = struct {
     nats_url: []const u8 = "nats://127.0.0.1:4222",
     subject: []const u8 = "pherb.whisper.>",
     whisper_bin: []const u8 = "/usr/local/bin/whisper-cli",
     models_dir: []const u8 = "/models/whisper",
+    output_dir: []const u8 = "/data/audio/outputs",
     threads: u8 = 8,
 };
 
 const subject_transcribe = "pherb.whisper.transcribe";
 const subject_status = "pherb.whisper.status";
+const subject_completed = "pherb.whisper.completed";
 
-/// Active job — tracks a running whisper-cli process and the NATS reply subject.
+/// Active job — tracks a running whisper-cli process.
 const ActiveJob = struct {
     child_pid: posix.pid_t,
-    reply_to: []const u8,
     job_id: []const u8,
     out_base: []const u8,
     wav_path: ?[]const u8,
@@ -40,6 +41,7 @@ pub fn main() !void {
     log.info("subject: {s}", .{config.subject});
     log.info("whisper-cli: {s}", .{config.whisper_bin});
     log.info("models: {s}", .{config.models_dir});
+    log.info("output: {s}", .{config.output_dir});
 
     // Initialize ZIO runtime (kqueue on FreeBSD)
     const rt = try zio.Runtime.init(allocator, .{});
@@ -81,7 +83,7 @@ pub fn main() !void {
     while (true) {
         // Check kqueue for child exit event (non-blocking)
         if (active_job) |*job| {
-            if (checkChildExit(kq, allocator, &conn, job)) {
+            if (checkChildExit(kq, allocator, &conn, &config, job)) {
                 active_job = null;
             }
         }
@@ -120,7 +122,7 @@ pub fn main() !void {
 }
 
 /// Check kqueue for child exit event. Returns true if child exited and job was completed.
-fn checkChildExit(kq: i32, allocator: std.mem.Allocator, conn: *nats.Connection, job: *ActiveJob) bool {
+fn checkChildExit(kq: i32, allocator: std.mem.Allocator, conn: *nats.Connection, config: *const Config, job: *ActiveJob) bool {
     var events: [1]posix.Kevent = undefined;
     const zero_timeout = posix.timespec{ .sec = 0, .nsec = 0 };
     const n = posix.kevent(kq, &.{}, &events, &zero_timeout) catch |err| {
@@ -136,10 +138,9 @@ fn checkChildExit(kq: i32, allocator: std.mem.Allocator, conn: *nats.Connection,
     // Reap the zombie
     _ = posix.waitpid(job.child_pid, 1); // WNOHANG — should return immediately
 
-    completeJob(allocator, conn, job, exit_code) catch |err| {
+    completeJob(allocator, conn, config, job, exit_code) catch |err| {
         log.err("[{s}] completion failed: {}", .{ job.job_id, err });
     };
-    allocator.free(job.reply_to);
     allocator.free(job.job_id);
     allocator.free(job.out_base);
     if (job.wav_path) |wp| allocator.free(wp);
@@ -159,13 +160,14 @@ fn handleStatus(conn: *nats.Connection, msg: *nats.Message, active_job: ?ActiveJ
     }
 }
 
-/// Reply to a transcribe request with busy status (instead of silently dropping).
+/// Publish busy status to the completion subject so the consumer knows immediately.
 fn replyBusy(conn: *nats.Connection, msg: *nats.Message, job: ActiveJob) void {
-    const reply_to = msg.reply orelse return;
-    var buf: [256]u8 = undefined;
+    _ = msg;
+    var buf: [512]u8 = undefined;
+    // Parse the incoming job_id from the message to include in the busy response
     const busy = std.fmt.bufPrint(&buf, "{{\"status\":\"busy\",\"active_job\":\"{s}\"}}", .{job.job_id}) catch return;
-    conn.publish(reply_to, busy) catch {};
-    log.info("busy, replied with active job {s}", .{job.job_id});
+    conn.publish(subject_completed, busy) catch {};
+    log.info("busy, published to {s} with active job {s}", .{ subject_completed, job.job_id });
 }
 
 /// Parse NATS message, convert audio if needed, spawn whisper-cli.
@@ -177,22 +179,15 @@ fn spawnJob(
     kq: i32,
     msg: *nats.Message,
 ) !?ActiveJob {
-    const reply_to = msg.reply orelse {
-        log.warn("no reply-to in message, ignoring", .{});
-        return null;
-    };
-
     const data = msg.data;
     if (data.len == 0) {
         log.warn("empty message, ignoring", .{});
-        try conn.publish(reply_to, "{\"error\":\"empty message\"}");
         return null;
     }
 
     // Parse JSON payload
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch {
         log.err("invalid JSON payload", .{});
-        try conn.publish(reply_to, "{\"error\":\"invalid JSON\"}");
         return null;
     };
     defer parsed.deinit();
@@ -201,7 +196,7 @@ fn spawnJob(
     const job_id_raw = getStr(root, "job_id") orelse "unknown";
     const audio_path = getStr(root, "audio_path") orelse {
         log.err("[{s}] missing audio_path", .{job_id_raw});
-        try conn.publish(reply_to, "{\"error\":\"missing audio_path\"}");
+        publishFailed(conn, job_id_raw, "missing audio_path");
         return null;
     };
     const model = getStr(root, "model") orelse "medium.en";
@@ -209,8 +204,6 @@ fn spawnJob(
     // Dupe strings we need to keep beyond this message's lifetime
     const job_id = try allocator.dupe(u8, job_id_raw);
     errdefer allocator.free(job_id);
-    const reply_dupe = try allocator.dupe(u8, reply_to);
-    errdefer allocator.free(reply_dupe);
 
     log.info("[{s}] transcribing: {s} (model={s})", .{ job_id, audio_path, model });
 
@@ -245,19 +238,19 @@ fn spawnJob(
         ffmpeg.stdout_behavior = .Ignore;
         ffmpeg.spawn() catch |err| {
             log.err("[{s}] ffmpeg spawn failed: {}", .{ job_id, err });
-            try conn.publish(reply_dupe, "{\"error\":\"ffmpeg spawn failed\"}");
+            publishFailed(conn, job_id, "ffmpeg spawn failed");
             allocator.free(wp);
             return null;
         };
         const ff_result = ffmpeg.wait() catch |err| {
             log.err("[{s}] ffmpeg wait failed: {}", .{ job_id, err });
-            try conn.publish(reply_dupe, "{\"error\":\"ffmpeg wait failed\"}");
+            publishFailed(conn, job_id, "ffmpeg wait failed");
             allocator.free(wp);
             return null;
         };
         if (ff_result.Exited != 0) {
             log.err("[{s}] ffmpeg exited with code {d}", .{ job_id, ff_result.Exited });
-            try conn.publish(reply_dupe, "{\"error\":\"ffmpeg conversion failed\"}");
+            publishFailed(conn, job_id, "ffmpeg conversion failed");
             allocator.free(wp);
             return null;
         }
@@ -279,7 +272,7 @@ fn spawnJob(
 
     child.spawn() catch |err| {
         log.err("[{s}] whisper-cli spawn failed: {}", .{ job_id, err });
-        try conn.publish(reply_dupe, "{\"error\":\"whisper-cli spawn failed\"}");
+        publishFailed(conn, job_id, "whisper-cli spawn failed");
         return null;
     };
 
@@ -298,22 +291,21 @@ fn spawnJob(
     };
     _ = posix.kevent(kq, &.{change}, &.{}, null) catch |err| {
         log.err("[{s}] kevent register failed: {}", .{ job_id, err });
-        // Fall through — worst case we detect exit via the next waitpid check
     };
 
     return ActiveJob{
         .child_pid = child_pid,
-        .reply_to = reply_dupe,
         .job_id = job_id,
         .out_base = out_base,
         .wav_path = wav_cleanup,
     };
 }
 
-/// Called when whisper-cli exits. Reads output JSON and publishes reply.
+/// Called when whisper-cli exits. Moves output to output_dir, publishes small completion event.
 fn completeJob(
     allocator: std.mem.Allocator,
     conn: *nats.Connection,
+    config: *const Config,
     job: *const ActiveJob,
     exit_code: u32,
 ) !void {
@@ -322,29 +314,66 @@ fn completeJob(
 
     if (exit_code != 0) {
         log.err("[{s}] whisper-cli exited with code {d}", .{ job.job_id, exit_code });
-        var err_buf: [256]u8 = undefined;
-        const err_msg = std.fmt.bufPrint(&err_buf, "{{\"error\":\"whisper-cli exit {d}\"}}", .{exit_code}) catch unreachable;
-        try conn.publish(job.reply_to, err_msg);
+        var err_buf: [128]u8 = undefined;
+        const err_detail = std.fmt.bufPrint(&err_buf, "whisper-cli exit {d}", .{exit_code}) catch "whisper-cli failed";
+        publishFailed(conn, job.job_id, err_detail);
         return;
     }
 
-    // Read output JSON
-    var json_path_buf: [512]u8 = undefined;
-    const json_path = std.fmt.bufPrint(&json_path_buf, "{s}.json", .{job.out_base}) catch unreachable;
+    // Source: whisper-cli writes to {out_base}.json in /tmp
+    var src_buf: [512]u8 = undefined;
+    const src_path = std.fmt.bufPrint(&src_buf, "{s}.json", .{job.out_base}) catch unreachable;
 
-    const json_data = std.fs.cwd().readFileAlloc(allocator, json_path, 64 * 1024 * 1024) catch |err| {
-        log.err("[{s}] failed to read output: {}", .{ job.job_id, err });
-        try conn.publish(job.reply_to, "{\"error\":\"no output file\"}");
+    // Destination: output_dir/{job_id}.whisper.json
+    var dst_buf: [512]u8 = undefined;
+    const dst_path = std.fmt.bufPrint(&dst_buf, "{s}/{s}.whisper.json", .{ config.output_dir, job.job_id }) catch unreachable;
+
+    // Move output file to output_dir (rename if same filesystem, copy+delete otherwise)
+    moveFile(allocator, src_path, dst_path) catch |err| {
+        log.err("[{s}] failed to move output to {s}: {}", .{ job.job_id, dst_path, err });
+        publishFailed(conn, job.job_id, "failed to move output file");
         return;
     };
-    defer allocator.free(json_data);
 
-    // Clean up temp files
-    std.fs.cwd().deleteFile(json_path) catch {};
+    // Clean up the bare temp file (whisper-cli also creates one without .json)
     std.fs.cwd().deleteFile(job.out_base) catch {};
 
-    log.info("[{s}] done, sending {d} bytes", .{ job.job_id, json_data.len });
-    try conn.publish(job.reply_to, json_data);
+    log.info("[{s}] done, output at {s}", .{ job.job_id, dst_path });
+
+    // Publish small completion event
+    var evt_buf: [768]u8 = undefined;
+    const evt = std.fmt.bufPrint(&evt_buf,
+        "{{\"job_id\":\"{s}\",\"status\":\"completed\",\"output_path\":\"{s}\"}}",
+        .{ job.job_id, dst_path },
+    ) catch unreachable;
+    conn.publish(subject_completed, evt) catch |err| {
+        log.err("[{s}] failed to publish completion: {}", .{ job.job_id, err });
+    };
+}
+
+/// Publish a failure event to pherb.whisper.completed.
+fn publishFailed(conn: *nats.Connection, job_id: []const u8, reason: []const u8) void {
+    var buf: [768]u8 = undefined;
+    const evt = std.fmt.bufPrint(&buf,
+        "{{\"job_id\":\"{s}\",\"status\":\"failed\",\"error\":\"{s}\"}}",
+        .{ job_id, reason },
+    ) catch return;
+    conn.publish(subject_completed, evt) catch {};
+}
+
+/// Move a file from src to dst. Tries rename first, falls back to copy+delete.
+fn moveFile(allocator: std.mem.Allocator, src: []const u8, dst: []const u8) !void {
+    // Try rename (works if same filesystem)
+    std.fs.cwd().rename(src, dst) catch |err| {
+        if (err != error.RenameAcrossMountPoints) return err;
+        // Fallback: read + write + delete
+        const data = try std.fs.cwd().readFileAlloc(allocator, src, 256 * 1024 * 1024);
+        defer allocator.free(data);
+        const dst_file = try std.fs.cwd().createFile(dst, .{});
+        defer dst_file.close();
+        try dst_file.writeAll(data);
+        std.fs.cwd().deleteFile(src) catch {};
+    };
 }
 
 fn getStr(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {

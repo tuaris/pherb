@@ -19,10 +19,7 @@ use Enchilada\Config\IniConfig;
 use Basis\Nats\Client as NatsClient;
 use Basis\Nats\Configuration as NatsConfiguration;
 use Pherb\JobStore;
-use Pherb\WhisperBackend;
-use Pherb\WhisperClient;
-use Pherb\WhisperCliBackend;
-use Pherb\WhisperNatsBackend;
+use Pherb\WhisperNatsDispatcher;
 use Pherb\PyannoteClient;
 use Pherb\Wav2vec2Client;
 use Pherb\TranscriptMerger;
@@ -36,7 +33,7 @@ class PherbConsumer
     use \Enchilada\Daemon\DaemonBehavior;
 
     private JobStore $jobStore;
-    private WhisperBackend $whisper;
+    private WhisperNatsDispatcher $whisperDispatcher;
     private PyannoteClient $pyannote;
     private Wav2vec2Client $wav2vec2;
     private TranscriptMerger $merger;
@@ -53,16 +50,6 @@ class PherbConsumer
     public function __construct(?IniConfig $settings = null)
     {
         $this->settings = $settings;
-
-        // Whisper backend selection (nats, cli, or http)
-        $whisperBackend = getenv('WHISPER_BACKEND') ?: ($settings ? $settings->getString('whisper', 'backend', 'nats') : 'nats');
-        if ($whisperBackend === 'cli') {
-            $whisperBinary = getenv('WHISPER_CLI_PATH') ?: ($settings ? $settings->getString('whisper', 'cli_path', '/usr/local/bin/whisper-cli') : '/usr/local/bin/whisper-cli');
-            $whisperModelsDir = getenv('WHISPER_MODELS_DIR') ?: ($settings ? $settings->getString('whisper', 'models_dir', '/models/whisper') : '/models/whisper');
-            $whisperThreads = (int)(getenv('WHISPER_THREADS') ?: ($settings ? $settings->getInt('whisper', 'threads', 8) : 8));
-        } elseif ($whisperBackend === 'http') {
-            $whisperUrl = getenv('WHISPER_URL') ?: ($settings ? $settings->getString('whisper', 'url', 'http://127.0.0.1:8080') : 'http://127.0.0.1:8080');
-        }
 
         // Service URLs
         $pyannoteUrl = getenv('PYANNOTE_URL') ?: ($settings ? $settings->getString('pyannote', 'url', 'http://127.0.0.1:9090') : 'http://127.0.0.1:9090');
@@ -81,11 +68,7 @@ class PherbConsumer
         $this->cleanupIntervalMin = (int)(getenv('CLEANUP_INTERVAL_MIN') ?: ($settings ? $settings->getInt('cleanup', 'interval_minutes', 60) : 60));
 
         // Initialize service clients
-        $this->whisper = match ($whisperBackend) {
-            'cli' => new WhisperCliBackend($whisperBinary, $whisperModelsDir, $whisperThreads),
-            'http' => new WhisperClient($whisperUrl),
-            default => new WhisperNatsBackend($this->natsHost, $this->natsPort),
-        };
+        $this->whisperDispatcher = new WhisperNatsDispatcher($this->natsHost, $this->natsPort);
         $this->pyannote = new PyannoteClient($pyannoteUrl);
         $this->wav2vec2 = new Wav2vec2Client($wav2vec2Url);
         $this->merger = new TranscriptMerger();
@@ -99,47 +82,117 @@ class PherbConsumer
     }
 
     /**
-     * Process a single transcription job.
+     * Dispatch a new job to the whisper-worker via NATS (fire-and-forget).
      */
-    private function processJob(string $jobId, string $audioPath, array $options, $jsMessage = null): void
+    private function dispatchJob(string $jobId, string $audioPath, array $options): void
     {
         $fullPath = $this->audioBasePath . '/' . ltrim($audioPath, '/');
         $model = $options['model'] ?? 'medium.en';
-        $diarize = (bool)($options['diarize'] ?? true);
-        $align = (bool)($options['align'] ?? false);
-        $format = $options['format'] ?? 'json';
-
-        $this->logDaemon("Processing job {$jobId}: {$audioPath} (model={$model}, diarize={$diarize}, align={$align}, format={$format})");
 
         if (!file_exists($fullPath)) {
             throw new \RuntimeException("Audio file not found: {$fullPath}");
         }
 
-        // JetStream heartbeat callback — extends ack deadline during long transcriptions
-        $heartbeat = ($jsMessage !== null) ? function () use ($jsMessage, $jobId) {
-            try {
-                $jsMessage->progress();
-                $this->logDaemon("[{$jobId}] JetStream InProgress heartbeat sent");
-            } catch (\Throwable $e) {
-                $this->logDaemon("[{$jobId}] Heartbeat failed: " . $e->getMessage());
-            }
-        } : null;
+        $this->logDaemon("[{$jobId}] Dispatching to whisper-worker: {$audioPath} (model={$model})");
+        $this->whisperDispatcher->dispatch($jobId, $fullPath, $model);
+    }
 
-        // Step 1: Transcribe with Whisper
-        $this->logDaemon("[{$jobId}] Calling whisper...");
-        $whisperResult = $this->whisper->transcribe($fullPath, $model, $heartbeat);
-        $this->logDaemon("[{$jobId}] Whisper complete: " . count($whisperResult['segments'] ?? []) . " segments");
+    /**
+     * Handle a whisper completion event — runs the rest of the pipeline.
+     *
+     * Reads the raw whisper output from disk, normalizes it, runs pyannote/wav2vec2,
+     * merges, formats, writes final output, and marks the job completed.
+     */
+    private function handleWhisperCompleted(array $event): void
+    {
+        $jobId = $event['job_id'] ?? '';
+        $status = $event['status'] ?? '';
+        $outputPath = $event['output_path'] ?? '';
 
-        // Step 2: Speaker diarization (optional)
+        if (empty($jobId)) {
+            $this->logDaemon("Ignoring completion event with missing job_id");
+            return;
+        }
+
+        // Handle busy replies (worker was already processing another job)
+        if ($status === 'busy') {
+            $this->logDaemon("[{$jobId}] Worker busy, will retry on next cycle");
+            return;
+        }
+
+        // Handle whisper-worker failure
+        if ($status === 'failed') {
+            $error = $event['error'] ?? 'unknown whisper-worker error';
+            $this->logDaemon("[{$jobId}] Whisper worker failed: {$error}");
+            $this->jobStore->markFailed($jobId, "Whisper: {$error}");
+            $this->incrementMetric('errors');
+            return;
+        }
+
+        if ($status !== 'completed' || empty($outputPath)) {
+            $this->logDaemon("[{$jobId}] Unexpected completion status: {$status}");
+            return;
+        }
+
+        $this->logDaemon("[{$jobId}] Whisper completed, output at {$outputPath}");
+
+        try {
+            $this->runPostWhisperPipeline($jobId, $outputPath);
+            $this->incrementMetric('processed');
+            echo "[" . date('H:i:s') . "] Job {$jobId} completed\n";
+        } catch (\Throwable $e) {
+            $this->logDaemon("[{$jobId}] Post-whisper pipeline FAILED: " . $e->getMessage());
+            $this->jobStore->markFailed($jobId, $e->getMessage());
+            $this->incrementMetric('errors');
+        }
+
+        $this->recordActivity();
+    }
+
+    /**
+     * Post-whisper pipeline: normalize → diarize → align → merge → format → write.
+     */
+    private function runPostWhisperPipeline(string $jobId, string $whisperOutputPath): void
+    {
+        // Read raw whisper-cli output from disk
+        if (!file_exists($whisperOutputPath)) {
+            throw new \RuntimeException("Whisper output file not found: {$whisperOutputPath}");
+        }
+
+        $rawJson = file_get_contents($whisperOutputPath);
+        $rawData = json_decode($rawJson, true);
+        if (!is_array($rawData)) {
+            throw new \RuntimeException("Invalid JSON in whisper output: {$whisperOutputPath}");
+        }
+
+        // Normalize raw whisper-cli format to standard segments
+        $whisperResult = $this->normalizeWhisperOutput($rawData);
+        $this->logDaemon("[{$jobId}] Normalized: " . count($whisperResult['segments'] ?? []) . " segments");
+
+        // Retrieve job record for options
+        $job = $this->jobStore->get($jobId);
+        if (!$job) {
+            throw new \RuntimeException("Job record not found: {$jobId}");
+        }
+
+        $opts = is_array($job['options']) ? $job['options'] : (json_decode($job['options'] ?? '{}', true) ?: []);
+        $audioPath = $job['audio_path'] ?? '';
+        $fullPath = $this->audioBasePath . '/' . ltrim($audioPath, '/');
+        $diarize = (bool)($opts['diarize'] ?? true);
+        $align = (bool)($opts['align'] ?? false);
+        $format = $opts['format'] ?? 'json';
+        $model = $opts['model'] ?? 'medium.en';
+
+        // Speaker diarization (optional)
         $speakerSegments = [];
-        if ($diarize) {
+        if ($diarize && file_exists($fullPath)) {
             $this->logDaemon("[{$jobId}] Calling pyannote...");
             $speakerSegments = $this->pyannote->diarize($fullPath);
             $this->logDaemon("[{$jobId}] Pyannote complete: " . count($speakerSegments) . " speaker segments");
         }
 
-        // Step 3: Forced alignment (optional)
-        if ($align) {
+        // Forced alignment (optional)
+        if ($align && file_exists($fullPath)) {
             $this->logDaemon("[{$jobId}] Calling wav2vec2 for alignment...");
             $words = $this->extractWordsForAlignment($whisperResult);
             $alignedWords = $this->wav2vec2->align($fullPath, $words);
@@ -147,12 +200,12 @@ class PherbConsumer
             $this->logDaemon("[{$jobId}] Alignment complete");
         }
 
-        // Step 4: Merge transcript with speaker info
+        // Merge transcript with speaker info
         $segments = $diarize
             ? $this->merger->merge($whisperResult, $speakerSegments)
             : $this->segmentsWithoutDiarization($whisperResult);
 
-        // Step 5: Format output
+        // Format output
         $outputContent = match ($format) {
             'srt' => $this->formatter->toSrt($segments),
             'vtt' => $this->formatter->toVtt($segments),
@@ -164,7 +217,7 @@ class PherbConsumer
             ]),
         };
 
-        // Step 6: Write output file
+        // Write final output file
         $ext = match ($format) {
             'srt' => 'srt',
             'vtt' => 'vtt',
@@ -178,16 +231,59 @@ class PherbConsumer
         $outputFile = $this->outputPath . "/{$jobId}.{$ext}";
         file_put_contents($outputFile, $outputContent);
 
-        $this->logDaemon("[{$jobId}] Output written: {$outputFile}");
+        $this->logDaemon("[{$jobId}] Final output written: {$outputFile}");
+
+        // Clean up intermediate whisper output
+        @unlink($whisperOutputPath);
 
         // Update job status
         $this->jobStore->markCompleted($jobId, $outputFile);
 
-        // Step 7: Webhook callback
+        // Webhook callback
         $job = $this->jobStore->get($jobId);
         if (!empty($job['callback_url'])) {
             $this->sendCallback($job['callback_url'], $job);
         }
+    }
+
+    /**
+     * Normalize whisper-cli --output-json-full format to standard segments format.
+     */
+    private function normalizeWhisperOutput(array $data): array
+    {
+        if (isset($data['segments'])) {
+            return $data;
+        }
+
+        if (!isset($data['transcription'])) {
+            return $data;
+        }
+
+        $segments = [];
+        foreach ($data['transcription'] as $seg) {
+            $words = [];
+            foreach ($seg['tokens'] ?? [] as $token) {
+                $text = trim($token['text'] ?? '');
+                if ($text === '' || $text === '[BLANK_AUDIO]') {
+                    continue;
+                }
+                $words[] = [
+                    'word' => $text,
+                    'start' => ($token['offsets']['from'] ?? 0) / 1000.0,
+                    'end' => ($token['offsets']['to'] ?? 0) / 1000.0,
+                    'probability' => (float)($token['p'] ?? 0),
+                ];
+            }
+
+            $segments[] = [
+                'start' => ($seg['offsets']['from'] ?? 0) / 1000.0,
+                'end' => ($seg['offsets']['to'] ?? 0) / 1000.0,
+                'text' => $seg['text'] ?? '',
+                'words' => $words,
+            ];
+        }
+
+        return ['segments' => $segments];
     }
 
     /**
@@ -385,7 +481,7 @@ class PherbConsumer
     {
         echo "Pherb Transcription Consumer\n";
         echo "============================\n";
-        echo "Whisper: " . get_class($this->whisper) . "\n";
+        echo "Whisper: dispatch via NATS (WhisperNatsDispatcher)\n";
         echo "NATS: {$this->natsHost}:{$this->natsPort}\n";
         echo "Audio: {$this->audioBasePath}\n";
         echo "Output: {$this->outputPath}\n";
@@ -404,36 +500,44 @@ class PherbConsumer
 
         $this->jobStore = new JobStore($pdo);
 
-        // Connect to NATS JetStream
+        // Connect to NATS
         $client = null;
         $queue = null;
         $reconnectDelay = 1;
 
         while ($this->daemonTick()) {
-            // Ensure NATS connection + JetStream consumer
+            // Ensure NATS connection + JetStream consumer + completion subscription
             if ($client === null || $queue === null) {
                 try {
                     $client = $this->createNatsClient();
 
-                    // Get or create stream + durable consumer
+                    // Get or create stream + durable consumer for new jobs
                     $stream = $client->getApi()->getStream('PHERB');
                     $stream->getConfiguration()->setSubjects(['pherb.jobs.>']);
                     $stream->createIfNotExists();
 
                     $consumer = $stream->getConsumer('pherb-worker');
                     $consumerConfig = $consumer->getConfiguration();
-                    $consumerConfig->setAckWait(300_000_000_000); // 5 min in nanoseconds
+                    $consumerConfig->setAckWait(30_000_000_000); // 30s — dispatch is instant
                     $consumerConfig->setMaxDeliver(3);
                     $consumerConfig->setSubjectFilter('pherb.jobs.transcribe');
                     $consumer->create();
 
-                    // Set up pull queue
                     $consumer->setExpires(2.0);
                     $consumer->setBatching(1);
                     $queue = $consumer->getQueue();
 
+                    // Subscribe to whisper completion events (plain NATS, not JetStream)
+                    $client->subscribe('pherb.whisper.completed', function ($msg) {
+                        $body = $msg->body ?? (string)$msg;
+                        $event = json_decode($body, true);
+                        if (is_array($event)) {
+                            $this->handleWhisperCompleted($event);
+                        }
+                    });
+
                     $reconnectDelay = 1;
-                    echo "Connected to NATS JetStream, waiting for jobs...\n\n";
+                    echo "Connected to NATS, waiting for jobs + completions...\n\n";
                 } catch (\Throwable $e) {
                     $this->logDaemon("NATS connect failed: " . $e->getMessage() . " (retry in {$reconnectDelay}s)");
                     $client = null;
@@ -444,17 +548,20 @@ class PherbConsumer
                 }
             }
 
-            // Pull messages from JetStream consumer
+            // 1. Process whisper completion events (non-blocking)
+            try {
+                $client->process(0);
+            } catch (\Throwable $e) {
+                $this->logDaemon("NATS process error: " . $e->getMessage());
+            }
+
+            // 2. Pull new jobs from JetStream and dispatch to whisper-worker
             try {
                 $messages = $queue->fetchAll(1);
             } catch (\Throwable $e) {
                 $this->logDaemon("NATS fetch error: " . $e->getMessage() . " (reconnecting)");
                 $client = null;
                 $queue = null;
-                continue;
-            }
-
-            if (empty($messages)) {
                 continue;
             }
 
@@ -478,20 +585,18 @@ class PherbConsumer
                 try {
                     $affected = $this->jobStore->markProcessing($jobId);
                     if ($affected === 0) {
-                        $this->logDaemon("[{$jobId}] Skipping: job not in queued state (redelivery of already-processed message)");
+                        $this->logDaemon("[{$jobId}] Skipping: not in queued state");
                         $message->ack();
                         continue;
                     }
-                    $this->processJob($jobId, $audioPath, $options, $message);
+
+                    // Dispatch to whisper-worker (fire-and-forget) and ACK immediately
+                    $this->dispatchJob($jobId, $audioPath, $options);
                     $message->ack();
-                    $this->incrementMetric('processed');
-                    echo "[" . date('H:i:s') . "] Job {$jobId} completed\n";
+                    $this->logDaemon("[{$jobId}] Dispatched to whisper-worker, ACKed JetStream");
                 } catch (\Throwable $e) {
-                    $this->logDaemon("[{$jobId}] FAILED: " . $e->getMessage());
-                    $rows = $this->jobStore->markFailed($jobId, $e->getMessage());
-                    if ($rows === 0) {
-                        $this->logDaemon("[{$jobId}] WARNING: markFailed affected 0 rows");
-                    }
+                    $this->logDaemon("[{$jobId}] Dispatch FAILED: " . $e->getMessage());
+                    $this->jobStore->markFailed($jobId, "Dispatch: " . $e->getMessage());
                     $message->ack();
                     $this->incrementMetric('errors');
                 }
@@ -499,7 +604,7 @@ class PherbConsumer
                 $this->recordActivity();
             }
 
-            // Periodic stale job recovery + cleanup
+            // 3. Periodic stale job recovery + cleanup
             $now = time();
             if (($now - $this->lastCleanupTime) >= ($this->cleanupIntervalMin * 60)) {
                 $this->lastCleanupTime = $now;
