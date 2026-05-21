@@ -3,5 +3,5 @@ config/local.conf.php
 temp/
 *.log
 .DS_Store
-cmd/whisper-worker/.zig-cache/
-cmd/whisper-worker/zig-out/
+cmd/pherb-worker/.zig-cache/
+cmd/pherb-worker/zig-out/

@@ -1,7 +1,7 @@
 .{
-    .name = .whisper_worker,
-    .version = "0.2.0",
-    .fingerprint = 0x2df75b1be6cf50de,
+    .name = .pherb_worker,
+    .version = "0.4.0",
+    .fingerprint = 0x353034d8a98628a4,
     .dependencies = .{
         .nats = .{
             .url = "https://github.com/lalinsky/nats.zig/archive/refs/heads/main.tar.gz",
