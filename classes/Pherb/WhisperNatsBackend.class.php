@@ -42,7 +42,7 @@ class WhisperNatsBackend implements WhisperBackend
     /**
      * {@inheritdoc}
      */
-    public function transcribe(string $filePath, string $model = 'medium.en'): array
+    public function transcribe(string $filePath, string $model = 'medium.en', ?callable $heartbeat = null): array
     {
         if (!file_exists($filePath)) {
             throw new \RuntimeException("Audio file not found: {$filePath}");
@@ -54,20 +54,21 @@ class WhisperNatsBackend implements WhisperBackend
             'model' => $model,
         ]);
 
-        // Create a dedicated NATS client with long timeout for request/reply
+        // Create a dedicated NATS client — short connection timeout, long overall deadline
         $config = new NatsConfiguration(
             host: $this->natsHost,
             port: $this->natsPort,
-            timeout: $this->timeout,
+            timeout: 60.0,
         );
 
         $client = new NatsClient($config);
         $client->setName('pherb-whisper-requester');
+        $client->skipInvalidMessages(true);
 
         $result = null;
         $error = null;
 
-        $client->request($this->subject, $payload, function ($response) use (&$result, &$error) {
+        $handler = function ($response) use (&$result, &$error) {
             $body = $response->body ?? (string)$response;
             $decoded = json_decode($body, true);
 
@@ -81,8 +82,37 @@ class WhisperNatsBackend implements WhisperBackend
                 return;
             }
 
+            if (isset($decoded['status']) && $decoded['status'] === 'busy') {
+                $activeJob = $decoded['active_job'] ?? 'unknown';
+                $error = "Whisper worker is busy processing job: {$activeJob}";
+                return;
+            }
+
             $result = $decoded;
-        });
+        };
+
+        // Manual request/reply with heartbeat loop — replaces blocking Client::request().
+        // Subscribe to a unique reply subject, publish request with reply-to, then
+        // loop with 60s iterations calling the heartbeat callback between each.
+        // This allows the consumer to send JetStream InProgress signals.
+        $replyTo = '_REPLY.' . bin2hex(random_bytes(12));
+        $client->subscribe($replyTo, $handler);
+        $client->publish($this->subject, $payload, $replyTo);
+
+        $deadline = microtime(true) + $this->timeout;
+        while ($result === null && $error === null) {
+            $remaining = $deadline - microtime(true);
+            if ($remaining <= 0) {
+                break;
+            }
+
+            $wait = min(60.0, $remaining);
+            $client->process($wait);
+
+            if ($result === null && $error === null && $heartbeat !== null) {
+                $heartbeat();
+            }
+        }
 
         $client->disconnect();
 

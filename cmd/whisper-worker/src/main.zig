@@ -2,18 +2,22 @@ const std = @import("std");
 const nats = @import("nats");
 const zio = @import("zio");
 const posix = std.posix;
+const c = std.c;
 
 const log = std.log.scoped(.whisper_worker);
 
-pub const version = "0.1.2";
+pub const version = "0.2.0";
 
 const Config = struct {
     nats_url: []const u8 = "nats://127.0.0.1:4222",
-    subject: []const u8 = "pherb.whisper.transcribe",
+    subject: []const u8 = "pherb.whisper.>",
     whisper_bin: []const u8 = "/usr/local/bin/whisper-cli",
     models_dir: []const u8 = "/models/whisper",
     threads: u8 = 8,
 };
+
+const subject_transcribe = "pherb.whisper.transcribe";
+const subject_status = "pherb.whisper.status";
 
 /// Active job — tracks a running whisper-cli process and the NATS reply subject.
 const ActiveJob = struct {
@@ -41,6 +45,10 @@ pub fn main() !void {
     const rt = try zio.Runtime.init(allocator, .{});
     defer rt.deinit();
 
+    // Create kqueue for event-driven child process monitoring
+    const kq = try posix.kqueue();
+    defer posix.close(kq);
+
     // Connect to NATS
     var conn = nats.Connection.init(allocator, .{});
     defer conn.deinit();
@@ -52,7 +60,7 @@ pub fn main() !void {
 
     log.info("connected to NATS", .{});
 
-    // Subscribe synchronously
+    // Subscribe to wildcard — dispatches transcribe and status requests
     const sub = conn.subscribeSync(config.subject) catch |err| {
         log.err("subscribe failed: {}", .{err});
         std.process.exit(1);
@@ -61,34 +69,25 @@ pub fn main() !void {
 
     log.info("subscribed to {s}, waiting for jobs...", .{config.subject});
 
-    // Main loop — state machine with non-blocking child wait.
-    // When idle: nextMsg blocks up to 30s (NATS handles PINGs during this time).
-    // When a child is running: nextMsg uses a short 2s timeout, then we check
-    // if the child exited via waitpid(WNOHANG). This keeps the NATS connection
-    // alive during long transcriptions without threads or polling.
+    // Main loop — event-driven via kqueue for child exit, NATS for messages.
+    //
+    // When idle: nextMsg blocks up to 30s (NATS library handles PINGs internally).
+    // When a child is running: nextMsg uses 100ms timeout, then we check kqueue
+    // for EVFILT_PROC child exit events. kqueue replaces waitpid(WNOHANG) polling —
+    // the kernel delivers the exit event immediately, we just need to check between
+    // NATS message fetches.
     var active_job: ?ActiveJob = null;
 
     while (true) {
-        // Check if active child has exited (non-blocking)
+        // Check kqueue for child exit event (non-blocking)
         if (active_job) |*job| {
-            const wait_result = posix.waitpid(job.child_pid, 1); // 1 = WNOHANG
-            if (wait_result.pid != 0) {
-                // Child exited — extract exit code from raw status
-                const raw = wait_result.status;
-                const exit_code: u32 = if (raw & 0x7f == 0) (raw >> 8) & 0xff else 255;
-                completeJob(allocator, &conn, job, exit_code) catch |err| {
-                    log.err("[{s}] completion failed: {}", .{ job.job_id, err });
-                };
-                allocator.free(job.reply_to);
-                allocator.free(job.job_id);
-                allocator.free(job.out_base);
-                if (job.wav_path) |wp| allocator.free(wp);
+            if (checkChildExit(kq, allocator, &conn, job)) {
                 active_job = null;
             }
         }
 
         // Wait for NATS messages — short timeout if child is running, long if idle
-        const timeout: u64 = if (active_job != null) 2000 else 30000;
+        const timeout: u64 = if (active_job != null) 100 else 30000;
         var msg = sub.nextMsg(timeout) catch |err| {
             if (err == error.Timeout) continue;
             log.err("receive error: {}", .{err});
@@ -96,17 +95,77 @@ pub fn main() !void {
         };
         defer msg.deinit();
 
-        // If we're already processing a job, ignore new messages (single worker)
-        if (active_job != null) {
-            log.warn("busy, ignoring message (job in progress)", .{});
+        // Dispatch by subject
+        if (std.mem.eql(u8, msg.subject, subject_status)) {
+            handleStatus(&conn, msg, active_job);
             continue;
         }
 
-        active_job = spawnJob(allocator, &conn, &config, msg) catch |err| {
+        if (!std.mem.eql(u8, msg.subject, subject_transcribe)) {
+            log.warn("unknown subject: {s}", .{msg.subject});
+            continue;
+        }
+
+        // Transcribe request — reply busy if already processing
+        if (active_job) |job| {
+            replyBusy(&conn, msg, job);
+            continue;
+        }
+
+        active_job = spawnJob(allocator, &conn, &config, kq, msg) catch |err| {
             log.err("spawn failed: {}", .{err});
             continue;
         };
     }
+}
+
+/// Check kqueue for child exit event. Returns true if child exited and job was completed.
+fn checkChildExit(kq: i32, allocator: std.mem.Allocator, conn: *nats.Connection, job: *ActiveJob) bool {
+    var events: [1]posix.Kevent = undefined;
+    const zero_timeout = posix.timespec{ .sec = 0, .nsec = 0 };
+    const n = posix.kevent(kq, &.{}, &events, &zero_timeout) catch |err| {
+        log.err("[{s}] kevent check failed: {}", .{ job.job_id, err });
+        return false;
+    };
+    if (n == 0) return false;
+
+    // EVFILT_PROC event fired — child exited. data field contains wait(2) status.
+    const raw: u32 = @truncate(@as(u64, @bitCast(events[0].data)));
+    const exit_code: u32 = if (raw & 0x7f == 0) (raw >> 8) & 0xff else 255;
+
+    // Reap the zombie
+    _ = posix.waitpid(job.child_pid, 1); // WNOHANG — should return immediately
+
+    completeJob(allocator, conn, job, exit_code) catch |err| {
+        log.err("[{s}] completion failed: {}", .{ job.job_id, err });
+    };
+    allocator.free(job.reply_to);
+    allocator.free(job.job_id);
+    allocator.free(job.out_base);
+    if (job.wav_path) |wp| allocator.free(wp);
+    return true;
+}
+
+/// Handle pherb.whisper.status request — reply with current worker state.
+fn handleStatus(conn: *nats.Connection, msg: *nats.Message, active_job: ?ActiveJob) void {
+    const reply_to = msg.reply orelse return;
+
+    if (active_job) |job| {
+        var buf: [256]u8 = undefined;
+        const status = std.fmt.bufPrint(&buf, "{{\"status\":\"busy\",\"job_id\":\"{s}\",\"pid\":{d}}}", .{ job.job_id, job.child_pid }) catch return;
+        conn.publish(reply_to, status) catch {};
+    } else {
+        conn.publish(reply_to, "{\"status\":\"idle\"}") catch {};
+    }
+}
+
+/// Reply to a transcribe request with busy status (instead of silently dropping).
+fn replyBusy(conn: *nats.Connection, msg: *nats.Message, job: ActiveJob) void {
+    const reply_to = msg.reply orelse return;
+    var buf: [256]u8 = undefined;
+    const busy = std.fmt.bufPrint(&buf, "{{\"status\":\"busy\",\"active_job\":\"{s}\"}}", .{job.job_id}) catch return;
+    conn.publish(reply_to, busy) catch {};
+    log.info("busy, replied with active job {s}", .{job.job_id});
 }
 
 /// Parse NATS message, convert audio if needed, spawn whisper-cli.
@@ -115,6 +174,7 @@ fn spawnJob(
     allocator: std.mem.Allocator,
     conn: *nats.Connection,
     config: *const Config,
+    kq: i32,
     msg: *nats.Message,
 ) !?ActiveJob {
     const reply_to = msg.reply orelse {
@@ -205,7 +265,7 @@ fn spawnJob(
         break :blk wp;
     };
 
-    // Spawn whisper-cli (non-blocking — main loop monitors via waitpid)
+    // Spawn whisper-cli (non-blocking — main loop monitors via kqueue)
     var child = std.process.Child.init(&.{
         config.whisper_bin,
         "-m",  model_path,
@@ -223,10 +283,26 @@ fn spawnJob(
         return null;
     };
 
-    log.info("[{s}] whisper-cli spawned (pid {d})", .{ job_id, child.id });
+    const child_pid: posix.pid_t = @intCast(child.id);
+    log.info("[{s}] whisper-cli spawned (pid {d})", .{ job_id, child_pid });
+
+    // Register child PID with kqueue for EVFILT_PROC + NOTE_EXIT.
+    // The kernel will deliver an event the instant the child exits.
+    const change = posix.Kevent{
+        .ident = @intCast(child_pid),
+        .filter = c.EVFILT.PROC,
+        .flags = c.EV.ADD | c.EV.ONESHOT,
+        .fflags = c.NOTE.EXIT,
+        .data = 0,
+        .udata = 0,
+    };
+    _ = posix.kevent(kq, &.{change}, &.{}, null) catch |err| {
+        log.err("[{s}] kevent register failed: {}", .{ job_id, err });
+        // Fall through — worst case we detect exit via the next waitpid check
+    };
 
     return ActiveJob{
-        .child_pid = @intCast(child.id),
+        .child_pid = child_pid,
         .reply_to = reply_dupe,
         .job_id = job_id,
         .out_base = out_base,

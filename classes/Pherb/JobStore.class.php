@@ -59,12 +59,13 @@ class JobStore
     /**
      * Mark a job as processing.
      */
-    public function markProcessing(string $id): void
+    public function markProcessing(string $id): int
     {
         $stmt = $this->db->prepare(
             "UPDATE jobs SET status = 'processing', started_at = NOW() WHERE id = :id AND status = 'queued'"
         );
         $stmt->execute(['id' => $id]);
+        return $stmt->rowCount();
     }
 
     /**
@@ -81,12 +82,13 @@ class JobStore
     /**
      * Mark a job as failed.
      */
-    public function markFailed(string $id, string $errorMessage): void
+    public function markFailed(string $id, string $errorMessage): int
     {
         $stmt = $this->db->prepare(
             "UPDATE jobs SET status = 'failed', error_message = :error, completed_at = NOW() WHERE id = :id"
         );
         $stmt->execute(['id' => $id, 'error' => $errorMessage]);
+        return $stmt->rowCount();
     }
 
     /**

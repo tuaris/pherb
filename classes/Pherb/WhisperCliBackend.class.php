@@ -34,7 +34,7 @@ class WhisperCliBackend implements WhisperBackend
     /**
      * {@inheritdoc}
      */
-    public function transcribe(string $filePath, string $model = 'medium.en'): array
+    public function transcribe(string $filePath, string $model = 'medium.en', ?callable $heartbeat = null): array
     {
         if (!file_exists($filePath)) {
             throw new \RuntimeException("Audio file not found: {$filePath}");

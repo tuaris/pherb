@@ -13,10 +13,11 @@ interface WhisperBackend
     /**
      * Transcribe an audio file.
      *
-     * @param string $filePath Absolute path to the audio file
-     * @param string $model    Model name (e.g., 'medium.en', 'small.en')
+     * @param string        $filePath  Absolute path to the audio file
+     * @param string        $model     Model name (e.g., 'medium.en', 'small.en')
+     * @param callable|null $heartbeat Called periodically during long transcriptions (e.g., every 60s)
      * @return array           Whisper verbose_json response with segments and word timestamps
      * @throws \RuntimeException If transcription fails
      */
-    public function transcribe(string $filePath, string $model = 'medium.en'): array;
+    public function transcribe(string $filePath, string $model = 'medium.en', ?callable $heartbeat = null): array;
 }

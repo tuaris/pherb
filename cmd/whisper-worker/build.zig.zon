@@ -1,6 +1,6 @@
 .{
     .name = .whisper_worker,
-    .version = "0.1.1",
+    .version = "0.2.0",
     .fingerprint = 0x2df75b1be6cf50de,
     .dependencies = .{
         .nats = .{

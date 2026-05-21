@@ -101,7 +101,7 @@ class PherbConsumer
     /**
      * Process a single transcription job.
      */
-    private function processJob(string $jobId, string $audioPath, array $options): void
+    private function processJob(string $jobId, string $audioPath, array $options, $jsMessage = null): void
     {
         $fullPath = $this->audioBasePath . '/' . ltrim($audioPath, '/');
         $model = $options['model'] ?? 'medium.en';
@@ -115,9 +115,19 @@ class PherbConsumer
             throw new \RuntimeException("Audio file not found: {$fullPath}");
         }
 
+        // JetStream heartbeat callback — extends ack deadline during long transcriptions
+        $heartbeat = ($jsMessage !== null) ? function () use ($jsMessage, $jobId) {
+            try {
+                $jsMessage->progress();
+                $this->logDaemon("[{$jobId}] JetStream InProgress heartbeat sent");
+            } catch (\Throwable $e) {
+                $this->logDaemon("[{$jobId}] Heartbeat failed: " . $e->getMessage());
+            }
+        } : null;
+
         // Step 1: Transcribe with Whisper
         $this->logDaemon("[{$jobId}] Calling whisper...");
-        $whisperResult = $this->whisper->transcribe($fullPath, $model);
+        $whisperResult = $this->whisper->transcribe($fullPath, $model, $heartbeat);
         $this->logDaemon("[{$jobId}] Whisper complete: " . count($whisperResult['segments'] ?? []) . " segments");
 
         // Step 2: Speaker diarization (optional)
@@ -288,6 +298,66 @@ class PherbConsumer
     }
 
     /**
+     * Deterministic stale job recovery via NATS status check.
+     *
+     * Queries the whisper-worker via pherb.whisper.status to determine
+     * if jobs stuck in 'processing' are genuinely alive or stale.
+     * Replaces the timer-based recoverStaleJobs(30min) guessing.
+     *
+     * @return int Number of stale jobs recovered
+     */
+    private function recoverStaleJobsViaNats(): int
+    {
+        $processing = $this->jobStore->listRecent(50, 'processing');
+        if (empty($processing)) {
+            return 0;
+        }
+
+        // Query whisper-worker status via a short-lived NATS connection
+        $workerStatus = null;
+        try {
+            $config = new NatsConfiguration(
+                host: $this->natsHost,
+                port: $this->natsPort,
+                timeout: 5.0,
+            );
+            $statusClient = new NatsClient($config);
+            $statusClient->setName('pherb-stale-checker');
+            $statusClient->request('pherb.whisper.status', '', function ($response) use (&$workerStatus) {
+                $body = $response->body ?? (string)$response;
+                $workerStatus = json_decode($body, true);
+            });
+            $statusClient->disconnect();
+        } catch (\Throwable $e) {
+            // Worker unreachable — all processing jobs are stale
+            $this->logDaemon("Whisper worker unreachable for status check: " . $e->getMessage());
+            $workerStatus = ['status' => 'unreachable'];
+        }
+
+        $recovered = 0;
+        foreach ($processing as $job) {
+            $jobId = $job['id'];
+
+            // If worker is busy with THIS job, it's alive — skip
+            if (is_array($workerStatus)
+                && ($workerStatus['status'] ?? '') === 'busy'
+                && ($workerStatus['job_id'] ?? '') === $jobId
+            ) {
+                continue;
+            }
+
+            // Worker is idle, busy with a different job, or unreachable — this job is stale
+            $rows = $this->jobStore->markFailed($jobId, 'Stale: whisper worker not processing this job');
+            if ($rows > 0) {
+                $this->logDaemon("[{$jobId}] Marked stale (worker status: " . ($workerStatus['status'] ?? 'unknown') . ")");
+                $recovered++;
+            }
+        }
+
+        return $recovered;
+    }
+
+    /**
      * Create and connect NATS JetStream client.
      */
     private function createNatsClient(): NatsClient
@@ -406,27 +476,35 @@ class PherbConsumer
                 $options = $data['options'] ?? [];
 
                 try {
-                    $this->jobStore->markProcessing($jobId);
-                    $this->processJob($jobId, $audioPath, $options);
+                    $affected = $this->jobStore->markProcessing($jobId);
+                    if ($affected === 0) {
+                        $this->logDaemon("[{$jobId}] Skipping: job not in queued state (redelivery of already-processed message)");
+                        $message->ack();
+                        continue;
+                    }
+                    $this->processJob($jobId, $audioPath, $options, $message);
                     $message->ack();
                     $this->incrementMetric('processed');
                     echo "[" . date('H:i:s') . "] Job {$jobId} completed\n";
                 } catch (\Throwable $e) {
                     $this->logDaemon("[{$jobId}] FAILED: " . $e->getMessage());
-                    $this->jobStore->markFailed($jobId, $e->getMessage());
-                    $message->nack(30.0); // retry after 30 seconds
+                    $rows = $this->jobStore->markFailed($jobId, $e->getMessage());
+                    if ($rows === 0) {
+                        $this->logDaemon("[{$jobId}] WARNING: markFailed affected 0 rows");
+                    }
+                    $message->ack();
                     $this->incrementMetric('errors');
                 }
 
                 $this->recordActivity();
             }
 
-            // Periodic cleanup + stale job recovery
+            // Periodic stale job recovery + cleanup
             $now = time();
             if (($now - $this->lastCleanupTime) >= ($this->cleanupIntervalMin * 60)) {
                 $this->lastCleanupTime = $now;
                 try {
-                    $recovered = $this->jobStore->recoverStaleJobs(30);
+                    $recovered = $this->recoverStaleJobsViaNats();
                     if ($recovered > 0) {
                         $this->logDaemon("Recovered {$recovered} stale processing job(s)");
                     }
