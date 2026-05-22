@@ -1,4 +1,4 @@
-# HAProxy configuration for Pherb — pherb.example.com
+# HAProxy configuration for Pherb
 #
 # Install on the production host (not in a jail) since all backend
 # jails use ip4=inherit and listen on 127.0.0.1.

@@ -1,50 +1,35 @@
 # Pherb Deployment Guide
 
-Production host: `your-host` (FreeBSD 15.0)
+Pherb is designed to run on FreeBSD with a jail-based architecture. The worker
+runs on the host (alongside whisper-cli and audio models), while the consumer,
+API, and supporting services each run in their own jail.
 
 ## Components
 
-| Component | Location | Managed By |
-|-----------|----------|------------|
-| pherb-worker | Host: `/usr/local/bin/pherb-worker` | `pkg` (your-repo repo) |
-| pherb-consumer | Jail `pherb`: `/usr/local/libexec/pherb/` | `pkg` (your-repo repo) |
-| pherb-api | Jail `pherb`: `/usr/local/www/pherb/` | `pkg` (your-repo repo) |
-| whisper-cli | Host: `/usr/local/bin/whisper-cli` | `pkg` (FreeBSD quarterly) |
-| pyannote | Jail `pyannote`: FastAPI on `:9090` | Manual |
-| wav2vec2 | Jail `wav2vec2`: FastAPI on `:9091` | Manual |
-| NATS | Jail `nats`: `:4222` | `pkg` |
-| MariaDB | Jail `mariadb`: `:3306` | `pkg` |
-| HAProxy | Host: `:8082` → pherb-api | `pkg` |
+| Component | Location | Description |
+|-----------|----------|-------------|
+| pherb-worker | Host: `/usr/local/bin/pherb-worker` | Multi-stage ML pipeline worker (Zig binary) |
+| pherb-consumer | Jail: `/usr/local/libexec/pherb/` | NATS JetStream consumer daemon (PHP) |
+| pherb-api | Jail: `/usr/local/www/pherb/` | REST API (PHP, Apache) |
+| whisper-cli | Host: `/usr/local/bin/whisper-cli` | Speech-to-text engine |
+| pyannote | Jail: FastAPI on `:9090` | Speaker diarization service |
+| wav2vec2 | Jail: FastAPI on `:9091` | Forced alignment service |
+| NATS | Jail: `:4222` | Message broker with JetStream |
+| MariaDB | Jail: `:3306` | Job database |
+| HAProxy | Host | TLS termination and routing |
 
 ## Jails
 
-```
-pyannote.morante.com    — speaker diarization (pyannote FastAPI)
-pherb.morante.com       — consumer + API (PHP, Apache)
-webdav.morante.com      — audio upload/download
-nats.morante.com        — NATS JetStream
-mariadb.morante.com     — MariaDB
-wav2vec2.morante.com    — forced alignment (wav2vec2 FastAPI)
-```
+Six jails, all using `ip4=inherit` (shared host IP):
 
-All jails use `ip4=inherit` (shared host IP).
-
-## Package Repository
-
-your-host uses the **your-repo** (extra_ports overlay) repo:
-
-```
-your-repo: {
-  url: "http://pkg.example.com/plus/FreeBSD:15:amd64",
-  mirror_type: "none",
-  enabled: yes
-}
-```
-
-Ports source: `git.example.com/freebsd/extra_ports` (plus tree)
-
-**Do NOT use the deluxe tree for this host.** The deluxe tree has pherb ports
-for consistency but they are not used here.
+| Jail | Purpose | Port | Audio Mount |
+|------|---------|------|-------------|
+| pherb | Consumer + API (PHP, Apache) | 8082 | /data/audio (rw) |
+| webdav | Audio upload/download | 8081 | /data/audio (rw) |
+| nats | NATS JetStream | 4222 | — |
+| mariadb | MariaDB | 3306 | — |
+| pyannote | Speaker diarization (Python venv) | 9090 | /data/audio (ro) |
+| wav2vec2 | Forced alignment (Python venv) | 9091 | /data/audio (ro) |
 
 ## NATS Subjects
 
@@ -123,27 +108,25 @@ All services monitored via monit (`/usr/local/etc/monit.d/`):
 
 ## Updating pherb-worker
 
-1. Tag release in the Pherb repo (`git tag v0.X.0 && git push --tags`)
-2. Update `www/pherb-worker` port in the plus tree (DISTVERSION, distinfo)
-3. Run `poudriere-overlay-update` Jenkins job (updates overlay tree + pkglist)
-4. Run `repos/extra-ports-150amd64` Jenkins job (builds the package)
-5. Deploy:
+1. Tag release in the Pherb repo (`git tag vX.Y.Z && git push --tags`)
+2. Update `www/pherb-worker` FreeBSD port (DISTVERSION, distinfo)
+3. Build updated package via poudriere
+4. Deploy:
    ```sh
-   ssh your-host 'service pherb_worker stop && \
-     pkg update -r your-repo && pkg upgrade -r your-repo pherb-worker && \
-     service pherb_worker start'
+   service pherb_worker stop
+   pkg update && pkg upgrade pherb-worker
+   service pherb_worker start
    ```
 
 ## Updating pherb-consumer / pherb-api
 
-1. Tag release, update `www/pherb` master port + slave ports in plus tree
-2. Same overlay-update + build steps as above
+1. Tag release, update `www/pherb` master port + slave ports
+2. Build updated packages via poudriere
 3. Deploy consumer:
    ```sh
-   ssh your-host 'jexec pherb service pherb_consumer stop && \
-     jexec pherb pkg update -r your-repo && \
-     jexec pherb pkg upgrade -r your-repo pherb-consumer && \
-     jexec pherb service pherb_consumer start'
+   jexec pherb service pherb_consumer stop
+   jexec pherb pkg update && jexec pherb pkg upgrade pherb-consumer
+   jexec pherb service pherb_consumer start
    ```
 
 ## Bootstrap Path Fix
