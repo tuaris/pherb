@@ -6,7 +6,7 @@ const c = std.c;
 
 const log = std.log.scoped(.pherb_worker);
 
-pub const version = "0.4.0";
+pub const version = "0.5.0";
 
 const Config = struct {
     nats_url: []const u8 = "nats://127.0.0.1:4222",
@@ -17,6 +17,49 @@ const Config = struct {
     pyannote_url: []const u8 = "http://127.0.0.1:9090",
     wav2vec2_url: []const u8 = "http://127.0.0.1:9091",
     threads: u8 = 8,
+
+    fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !Config {
+        var config = Config{};
+        const content = std.fs.cwd().readFileAlloc(allocator, path, 64 * 1024) catch |err| {
+            if (err == error.FileNotFound) {
+                log.warn("config file not found: {s}, using defaults", .{path});
+                return config;
+            }
+            return err;
+        };
+        defer allocator.free(content);
+
+        var iter = std.mem.splitScalar(u8, content, '\n');
+        while (iter.next()) |raw_line| {
+            const line = std.mem.trim(u8, raw_line, &std.ascii.whitespace);
+            if (line.len == 0 or line[0] == '#' or line[0] == ';') continue;
+            const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+            const key = std.mem.trim(u8, line[0..eq], &std.ascii.whitespace);
+            const val = std.mem.trim(u8, line[eq + 1 ..], &std.ascii.whitespace);
+            if (val.len == 0) continue;
+
+            if (std.mem.eql(u8, key, "nats_url")) {
+                config.nats_url = try allocator.dupe(u8, val);
+            } else if (std.mem.eql(u8, key, "subject")) {
+                config.subject = try allocator.dupe(u8, val);
+            } else if (std.mem.eql(u8, key, "whisper_bin")) {
+                config.whisper_bin = try allocator.dupe(u8, val);
+            } else if (std.mem.eql(u8, key, "models_dir")) {
+                config.models_dir = try allocator.dupe(u8, val);
+            } else if (std.mem.eql(u8, key, "output_dir")) {
+                config.output_dir = try allocator.dupe(u8, val);
+            } else if (std.mem.eql(u8, key, "pyannote_url")) {
+                config.pyannote_url = try allocator.dupe(u8, val);
+            } else if (std.mem.eql(u8, key, "wav2vec2_url")) {
+                config.wav2vec2_url = try allocator.dupe(u8, val);
+            } else if (std.mem.eql(u8, key, "threads")) {
+                config.threads = std.fmt.parseInt(u8, val, 10) catch 8;
+            }
+        }
+
+        log.info("loaded config from {s}", .{path});
+        return config;
+    }
 };
 
 const subject_whisper = "pherb.worker.whisper";
@@ -45,7 +88,25 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const config = Config{};
+    // Parse -c flag for config file path
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
+
+    var config_path: []const u8 = "/usr/local/etc/pherb/worker.conf";
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "-c") and i + 1 < args.len) {
+            i += 1;
+            config_path = args[i];
+        } else if (std.mem.eql(u8, args[i], "-v") or std.mem.eql(u8, args[i], "--version")) {
+            var ver_buf: [64]u8 = undefined;
+            const ver_msg = std.fmt.bufPrint(&ver_buf, "pherb-worker {s}\n", .{version}) catch unreachable;
+            std.fs.File.stdout().writeAll(ver_msg) catch {};
+            return;
+        }
+    }
+
+    const config = try Config.loadFromFile(allocator, config_path);
 
     log.info("pherb-worker {s} starting", .{version});
     log.info("NATS: {s}", .{config.nats_url});
