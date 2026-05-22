@@ -1,86 +1,99 @@
 const std = @import("std");
 const nats = @import("nats");
-const zio = @import("zio");
 const posix = std.posix;
 const c = std.c;
+const zio = @import("zio");
 
 const log = std.log.scoped(.pherb_worker);
 
-pub const version = "0.5.0";
+pub const version = "0.6.0";
+
+const subject_status = "pherb.worker.status";
+const subject_completed = "pherb.pipeline.completed";
+
+const max_stages = 16;
+const max_argv = 32;
+
+const StageEntry = struct {
+    subject: []const u8,
+    command_template: []const u8,
+};
 
 const Config = struct {
     nats_url: []const u8 = "nats://127.0.0.1:4222",
-    subject: []const u8 = "pherb.worker.>",
-    whisper_bin: []const u8 = "/usr/local/bin/whisper-cli",
-    models_dir: []const u8 = "/models/whisper",
-    output_dir: []const u8 = "/data/audio/outputs",
-    pyannote_url: []const u8 = "http://127.0.0.1:9090",
-    wav2vec2_url: []const u8 = "http://127.0.0.1:9091",
-    threads: u8 = 8,
+    stages: [max_stages]?StageEntry = .{null} ** max_stages,
+    stage_count: usize = 0,
 
     fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !Config {
         var config = Config{};
         const content = std.fs.cwd().readFileAlloc(allocator, path, 64 * 1024) catch |err| {
             if (err == error.FileNotFound) {
-                log.warn("config file not found: {s}, using defaults", .{path});
-                return config;
+                log.err("config file not found: {s}", .{path});
+                std.process.exit(1);
             }
             return err;
         };
         defer allocator.free(content);
 
+        var in_stages = false;
         var iter = std.mem.splitScalar(u8, content, '\n');
         while (iter.next()) |raw_line| {
             const line = std.mem.trim(u8, raw_line, &std.ascii.whitespace);
             if (line.len == 0 or line[0] == '#' or line[0] == ';') continue;
+
+            // Section header
+            if (line[0] == '[') {
+                in_stages = std.mem.eql(u8, line, "[stages]");
+                continue;
+            }
+
             const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
             const key = std.mem.trim(u8, line[0..eq], &std.ascii.whitespace);
             const val = std.mem.trim(u8, line[eq + 1 ..], &std.ascii.whitespace);
             if (val.len == 0) continue;
 
-            if (std.mem.eql(u8, key, "nats_url")) {
-                config.nats_url = try allocator.dupe(u8, val);
-            } else if (std.mem.eql(u8, key, "subject")) {
-                config.subject = try allocator.dupe(u8, val);
-            } else if (std.mem.eql(u8, key, "whisper_bin")) {
-                config.whisper_bin = try allocator.dupe(u8, val);
-            } else if (std.mem.eql(u8, key, "models_dir")) {
-                config.models_dir = try allocator.dupe(u8, val);
-            } else if (std.mem.eql(u8, key, "output_dir")) {
-                config.output_dir = try allocator.dupe(u8, val);
-            } else if (std.mem.eql(u8, key, "pyannote_url")) {
-                config.pyannote_url = try allocator.dupe(u8, val);
-            } else if (std.mem.eql(u8, key, "wav2vec2_url")) {
-                config.wav2vec2_url = try allocator.dupe(u8, val);
-            } else if (std.mem.eql(u8, key, "threads")) {
-                config.threads = std.fmt.parseInt(u8, val, 10) catch 8;
+            if (in_stages) {
+                if (config.stage_count >= max_stages) {
+                    log.warn("max stages ({d}) reached, ignoring: {s}", .{ max_stages, key });
+                    continue;
+                }
+                config.stages[config.stage_count] = StageEntry{
+                    .subject = try allocator.dupe(u8, key),
+                    .command_template = try allocator.dupe(u8, val),
+                };
+                config.stage_count += 1;
+            } else {
+                if (std.mem.eql(u8, key, "nats_url")) {
+                    config.nats_url = try allocator.dupe(u8, val);
+                }
             }
+        }
+
+        if (config.stage_count == 0) {
+            log.err("no [stages] defined in config", .{});
+            std.process.exit(1);
         }
 
         log.info("loaded config from {s}", .{path});
         return config;
     }
+
+    fn findCommand(self: *const Config, subject: []const u8) ?[]const u8 {
+        for (self.stages[0..self.stage_count]) |entry| {
+            if (entry) |e| {
+                if (std.mem.eql(u8, e.subject, subject)) return e.command_template;
+            }
+        }
+        return null;
+    }
 };
 
-const subject_whisper = "pherb.worker.whisper";
-const subject_pyannote = "pherb.worker.pyannote";
-const subject_align = "pherb.worker.align";
-const subject_status = "pherb.worker.status";
-const subject_completed = "pherb.pipeline.completed";
-
-const Stage = enum {
-    whisper,
-    pyannote,
-    alignment,
-};
-
-/// Active job — tracks a running child process (whisper-cli or curl).
+/// Active job — tracks a running child process.
 const ActiveJob = struct {
     child_pid: posix.pid_t,
     job_id: []const u8,
-    stage: Stage,
-    out_path: []const u8,
-    cleanup_paths: [4]?[]const u8,
+    stage_name: []const u8,
+    output_path: []const u8,
 };
 
 pub fn main() !void {
@@ -110,14 +123,14 @@ pub fn main() !void {
 
     log.info("pherb-worker {s} starting", .{version});
     log.info("NATS: {s}", .{config.nats_url});
-    log.info("subject: {s}", .{config.subject});
-    log.info("whisper-cli: {s}", .{config.whisper_bin});
-    log.info("models: {s}", .{config.models_dir});
-    log.info("output: {s}", .{config.output_dir});
-    log.info("pyannote: {s}", .{config.pyannote_url});
-    log.info("wav2vec2: {s}", .{config.wav2vec2_url});
+    log.info("stages: {d} configured", .{config.stage_count});
+    for (config.stages[0..config.stage_count]) |entry| {
+        if (entry) |e| {
+            log.info("  {s} → {s}", .{ e.subject, e.command_template });
+        }
+    }
 
-    // Initialize ZIO runtime (kqueue on FreeBSD)
+    // Initialize ZIO runtime (required by nats library — uses kqueue on FreeBSD)
     const rt = try zio.Runtime.init(allocator, .{});
     defer rt.deinit();
 
@@ -136,28 +149,23 @@ pub fn main() !void {
 
     log.info("connected to NATS", .{});
 
-    // Subscribe to wildcard — dispatches transcribe and status requests
-    const sub = conn.subscribeSync(config.subject) catch |err| {
+    // Subscribe to wildcard — single subscription handles all subjects.
+    // Command lookup filters to only configured stages.
+    const sub = conn.subscribeSync("pherb.worker.>") catch |err| {
         log.err("subscribe failed: {}", .{err});
         std.process.exit(1);
     };
     defer sub.deinit();
 
-    log.info("subscribed to {s}, waiting for jobs...", .{config.subject});
+    log.info("subscribed to pherb.worker.>, waiting for jobs...", .{});
 
     // Main loop — event-driven via kqueue for child exit, NATS for messages.
-    //
-    // When idle: nextMsg blocks up to 30s (NATS library handles PINGs internally).
-    // When a child is running: nextMsg uses 100ms timeout, then we check kqueue
-    // for EVFILT_PROC child exit events. kqueue replaces waitpid(WNOHANG) polling —
-    // the kernel delivers the exit event immediately, we just need to check between
-    // NATS message fetches.
     var active_job: ?ActiveJob = null;
 
     while (true) {
         // Check kqueue for child exit event (non-blocking)
         if (active_job) |*job| {
-            if (checkChildExit(kq, allocator, &conn, &config, job)) {
+            if (checkChildExit(kq, allocator, &conn, job)) {
                 active_job = null;
             }
         }
@@ -171,40 +179,32 @@ pub fn main() !void {
         };
         defer msg.deinit();
 
-        // Dispatch by subject
+        // Status request
         if (std.mem.eql(u8, msg.subject, subject_status)) {
             handleStatus(&conn, msg, active_job);
             continue;
         }
 
-        // Determine which stage this message is for
-        const stage: Stage = if (std.mem.eql(u8, msg.subject, subject_whisper))
-            .whisper
-        else if (std.mem.eql(u8, msg.subject, subject_pyannote))
-            .pyannote
-        else if (std.mem.eql(u8, msg.subject, subject_align))
-            .alignment
-        else {
-            log.warn("unknown subject: {s}", .{msg.subject});
-            continue;
-        };
-
         // Reply busy if already processing
         if (active_job) |job| {
-            replyBusy(&conn, msg, job);
+            replyBusy(&conn, &job);
             continue;
         }
 
-        active_job = spawnStage(allocator, &conn, &config, kq, msg, stage) catch |err| {
+        // Look up command for this subject — ignore unconfigured subjects
+        const command_template = config.findCommand(msg.subject) orelse {
+            continue;
+        };
+
+        active_job = spawnCommand(allocator, &conn, kq, msg, command_template) catch |err| {
             log.err("spawn failed: {}", .{err});
             continue;
         };
     }
 }
 
-/// Check kqueue for child exit event. Returns true if child exited and job was completed.
-fn checkChildExit(kq: i32, allocator: std.mem.Allocator, conn: *nats.Connection, config: *const Config, job: *ActiveJob) bool {
-    _ = config;
+/// Check kqueue for child exit event. Returns true if child exited.
+fn checkChildExit(kq: i32, allocator: std.mem.Allocator, conn: *nats.Connection, job: *ActiveJob) bool {
     var events: [1]posix.Kevent = undefined;
     const zero_timeout = posix.timespec{ .sec = 0, .nsec = 0 };
     const n = posix.kevent(kq, &.{}, &events, &zero_timeout) catch |err| {
@@ -213,27 +213,35 @@ fn checkChildExit(kq: i32, allocator: std.mem.Allocator, conn: *nats.Connection,
     };
     if (n == 0) return false;
 
-    // EVFILT_PROC event fired — child exited. data field contains wait(2) status.
+    // EVFILT_PROC event fired — child exited
     const raw: u32 = @truncate(@as(u64, @bitCast(events[0].data)));
     const exit_code: u32 = if (raw & 0x7f == 0) (raw >> 8) & 0xff else 255;
 
     // Reap the zombie
-    _ = posix.waitpid(job.child_pid, 1); // WNOHANG — should return immediately
+    _ = posix.waitpid(job.child_pid, 1);
 
-    completeJob(allocator, conn, job, exit_code) catch |err| {
-        log.err("[{s}] completion failed: {}", .{ job.job_id, err });
-    };
+    if (exit_code != 0) {
+        log.err("[{s}] {s} exited with code {d}", .{ job.job_id, job.stage_name, exit_code });
+        var err_buf: [128]u8 = undefined;
+        const err_detail = std.fmt.bufPrint(&err_buf, "{s} exit {d}", .{ job.stage_name, exit_code }) catch "process failed";
+        publishFailed(conn, job.job_id, job.stage_name, err_detail);
+    } else {
+        log.info("[{s}] {s} done, output at {s}", .{ job.job_id, job.stage_name, job.output_path });
+
+        var evt_buf: [768]u8 = undefined;
+        const evt = std.fmt.bufPrint(&evt_buf,
+            "{{\"job_id\":\"{s}\",\"stage\":\"{s}\",\"status\":\"completed\",\"output_path\":\"{s}\"}}",
+            .{ job.job_id, job.stage_name, job.output_path },
+        ) catch unreachable;
+        conn.publish(subject_completed, evt) catch |err| {
+            log.err("[{s}] failed to publish completion: {}", .{ job.job_id, err });
+        };
+    }
 
     // Free allocated resources
     allocator.free(job.job_id);
-    allocator.free(job.out_path);
-    for (&job.cleanup_paths) |*p| {
-        if (p.*) |path| {
-            std.fs.cwd().deleteFile(path) catch {};
-            allocator.free(path);
-            p.* = null;
-        }
-    }
+    allocator.free(job.stage_name);
+    allocator.free(job.output_path);
     return true;
 }
 
@@ -243,31 +251,28 @@ fn handleStatus(conn: *nats.Connection, msg: *nats.Message, active_job: ?ActiveJ
 
     if (active_job) |job| {
         var buf: [256]u8 = undefined;
-        const stage_name = @tagName(job.stage);
-        const status = std.fmt.bufPrint(&buf, "{{\"status\":\"busy\",\"job_id\":\"{s}\",\"stage\":\"{s}\",\"pid\":{d}}}", .{ job.job_id, stage_name, job.child_pid }) catch return;
+        const status = std.fmt.bufPrint(&buf, "{{\"status\":\"busy\",\"job_id\":\"{s}\",\"stage\":\"{s}\",\"pid\":{d}}}", .{ job.job_id, job.stage_name, job.child_pid }) catch return;
         conn.publish(reply_to, status) catch {};
     } else {
         conn.publish(reply_to, "{\"status\":\"idle\"}") catch {};
     }
 }
 
-/// Publish busy status to the completion subject so the consumer knows immediately.
-fn replyBusy(conn: *nats.Connection, msg: *nats.Message, job: ActiveJob) void {
-    _ = msg;
+/// Publish busy status to the completion subject.
+fn replyBusy(conn: *nats.Connection, job: *const ActiveJob) void {
     var buf: [512]u8 = undefined;
-    const busy = std.fmt.bufPrint(&buf, "{{\"status\":\"busy\",\"active_job\":\"{s}\",\"stage\":\"{s}\"}}", .{ job.job_id, @tagName(job.stage) }) catch return;
+    const busy = std.fmt.bufPrint(&buf, "{{\"status\":\"busy\",\"active_job\":\"{s}\",\"stage\":\"{s}\"}}", .{ job.job_id, job.stage_name }) catch return;
     conn.publish(subject_completed, busy) catch {};
-    log.info("busy ({s}), active job {s}", .{ @tagName(job.stage), job.job_id });
+    log.info("busy ({s}), active job {s}", .{ job.stage_name, job.job_id });
 }
 
-/// Dispatch to the appropriate stage handler based on subject.
-fn spawnStage(
+/// Spawn a command from the template, expanding variables from the NATS payload.
+fn spawnCommand(
     allocator: std.mem.Allocator,
     conn: *nats.Connection,
-    config: *const Config,
     kq: i32,
     msg: *nats.Message,
-    stage: Stage,
+    command_template: []const u8,
 ) !?ActiveJob {
     const data = msg.data;
     if (data.len == 0) {
@@ -285,229 +290,87 @@ fn spawnStage(
     const root = parsed.value.object;
     const job_id_raw = getStr(root, "job_id") orelse "unknown";
     const audio_path = getStr(root, "audio_path") orelse {
-        log.err("[{s}] missing audio_path", .{job_id_raw});
-        publishFailed(conn, job_id_raw, stage, "missing audio_path");
+        log.err("[{s}] missing audio_path in payload", .{job_id_raw});
+        return null;
+    };
+    const output_path_raw = getStr(root, "output_path") orelse {
+        log.err("[{s}] missing output_path in payload", .{job_id_raw});
         return null;
     };
 
-    // Dupe job_id — lives beyond message lifetime
+    // Derive stage name from subject (last segment after '.')
+    const stage_name_raw = blk: {
+        if (std.mem.lastIndexOfScalar(u8, msg.subject, '.')) |idx| {
+            break :blk msg.subject[idx + 1 ..];
+        }
+        break :blk msg.subject;
+    };
+
+    // Dupe strings — they must outlive the message
     const job_id = try allocator.dupe(u8, job_id_raw);
     errdefer allocator.free(job_id);
+    const output_path = try allocator.dupe(u8, output_path_raw);
+    errdefer allocator.free(output_path);
+    const stage_name = try allocator.dupe(u8, stage_name_raw);
+    errdefer allocator.free(stage_name);
 
-    return switch (stage) {
-        .whisper => spawnWhisper(allocator, conn, config, kq, job_id, audio_path, root),
-        .pyannote => spawnCurl(allocator, conn, config, kq, job_id, audio_path, .pyannote, null),
-        .alignment => blk: {
-            const transcript_path = getStr(root, "transcript_path");
-            break :blk spawnCurl(allocator, conn, config, kq, job_id, audio_path, .alignment, transcript_path);
-        },
-    };
-}
+    log.info("[{s}] {s}: {s} → {s}", .{ job_id, stage_name, audio_path, output_path });
 
-/// Spawn whisper-cli for transcription.
-fn spawnWhisper(
-    allocator: std.mem.Allocator,
-    conn: *nats.Connection,
-    config: *const Config,
-    kq: i32,
-    job_id: []const u8,
-    audio_path: []const u8,
-    root: std.json.ObjectMap,
-) !?ActiveJob {
-    const model = getStr(root, "model") orelse "medium.en";
-
-    log.info("[{s}] whisper: {s} (model={s})", .{ job_id, audio_path, model });
-
-    // Build paths
-    var model_path_buf: [512]u8 = undefined;
-    const model_path = std.fmt.bufPrint(&model_path_buf, "{s}/ggml-{s}.bin", .{ config.models_dir, model }) catch unreachable;
-
-    var out_base_buf: [512]u8 = undefined;
-    const out_base_slice = std.fmt.bufPrint(&out_base_buf, "{s}/.tmp_whisper_{s}", .{ config.output_dir, job_id }) catch unreachable;
-
-    // Output destination
-    var out_path_buf: [512]u8 = undefined;
-    const out_path_slice = std.fmt.bufPrint(&out_path_buf, "{s}/{s}.whisper.json", .{ config.output_dir, job_id }) catch unreachable;
-    const out_path = try allocator.dupe(u8, out_path_slice);
-    errdefer allocator.free(out_path);
-
-    const out_base = try allocator.dupe(u8, out_base_slice);
-    errdefer allocator.free(out_base);
-
-    var threads_buf: [4]u8 = undefined;
-    const threads_str = std.fmt.bufPrint(&threads_buf, "{d}", .{config.threads}) catch unreachable;
-
-    // Convert to WAV if needed (ffmpeg is fast, blocking here is fine)
-    var wav_cleanup: ?[]const u8 = null;
-    const wav_path: []const u8 = blk: {
-        if (std.mem.endsWith(u8, audio_path, ".wav")) {
-            break :blk audio_path;
-        }
-        var wav_buf: [512]u8 = undefined;
-        const wp_slice = std.fmt.bufPrint(&wav_buf, "{s}/.tmp_wav_{s}.wav", .{ config.output_dir, job_id }) catch unreachable;
-        const wp = try allocator.dupe(u8, wp_slice);
-
-        log.info("[{s}] converting to WAV...", .{job_id});
-        var ffmpeg = std.process.Child.init(&.{
-            "/usr/local/bin/ffmpeg", "-y", "-i", audio_path,
-            "-ar", "16000", "-ac", "1", wp,
-        }, allocator);
-        ffmpeg.stderr_behavior = .Ignore;
-        ffmpeg.stdout_behavior = .Ignore;
-        ffmpeg.spawn() catch |err| {
-            log.err("[{s}] ffmpeg spawn failed: {}", .{ job_id, err });
-            publishFailed(conn, job_id, .whisper, "ffmpeg spawn failed");
-            allocator.free(wp);
-            return null;
-        };
-        const ff_result = ffmpeg.wait() catch |err| {
-            log.err("[{s}] ffmpeg wait failed: {}", .{ job_id, err });
-            publishFailed(conn, job_id, .whisper, "ffmpeg wait failed");
-            allocator.free(wp);
-            return null;
-        };
-        if (ff_result.Exited != 0) {
-            log.err("[{s}] ffmpeg exited with code {d}", .{ job_id, ff_result.Exited });
-            publishFailed(conn, job_id, .whisper, "ffmpeg conversion failed");
-            allocator.free(wp);
-            return null;
-        }
-        wav_cleanup = wp;
-        break :blk wp;
-    };
-
-    // Spawn whisper-cli (non-blocking — main loop monitors via kqueue)
-    var child = std.process.Child.init(&.{
-        config.whisper_bin,
-        "-m",  model_path,
-        "-f",  wav_path,
-        "-t",  threads_str,
-        "--output-json-full",
-        "-of", out_base,
-    }, allocator);
-    child.stderr_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-
-    child.spawn() catch |err| {
-        log.err("[{s}] whisper-cli spawn failed: {}", .{ job_id, err });
-        publishFailed(conn, job_id, .whisper, "whisper-cli spawn failed");
-        return null;
-    };
-
-    const child_pid: posix.pid_t = @intCast(child.id);
-    log.info("[{s}] whisper-cli spawned (pid {d})", .{ job_id, child_pid });
-
-    registerKqueue(kq, child_pid, job_id);
-
-    return ActiveJob{
-        .child_pid = child_pid,
-        .job_id = job_id,
-        .stage = .whisper,
-        .out_path = out_path,
-        .cleanup_paths = .{ out_base, wav_cleanup, null, null },
-    };
-}
-
-/// Spawn curl for pyannote or wav2vec2 HTTP stage.
-fn spawnCurl(
-    allocator: std.mem.Allocator,
-    conn: *nats.Connection,
-    config: *const Config,
-    kq: i32,
-    job_id: []const u8,
-    audio_path: []const u8,
-    stage: Stage,
-    transcript_path: ?[]const u8,
-) !?ActiveJob {
-    const stage_name = @tagName(stage);
-
-    // Determine URL and output extension
-    var url_buf: [512]u8 = undefined;
-    const url: []const u8 = switch (stage) {
-        .pyannote => std.fmt.bufPrint(&url_buf, "{s}/diarize", .{config.pyannote_url}) catch unreachable,
-        .alignment => std.fmt.bufPrint(&url_buf, "{s}/align", .{config.wav2vec2_url}) catch unreachable,
-        .whisper => unreachable,
-    };
-    const ext: []const u8 = switch (stage) {
-        .pyannote => "pyannote.json",
-        .alignment => "align.json",
-        .whisper => unreachable,
-    };
-
-    // Output path
-    var out_path_buf: [512]u8 = undefined;
-    const out_path_slice = std.fmt.bufPrint(&out_path_buf, "{s}/{s}.{s}", .{ config.output_dir, job_id, ext }) catch unreachable;
-    const out_path = try allocator.dupe(u8, out_path_slice);
-    errdefer allocator.free(out_path);
-
-    log.info("[{s}] {s}: {s}", .{ job_id, stage_name, audio_path });
-
-    // Build curl form field for file upload
-    var file_form_buf: [512]u8 = undefined;
-    const file_form = std.fmt.bufPrint(&file_form_buf, "file=@{s}", .{audio_path}) catch unreachable;
-
-    // Build argv dynamically based on stage
-    var argv_buf: [16][]const u8 = undefined;
+    // Expand template variables and split into argv
+    var argv_buf: [max_argv][]const u8 = undefined;
     var argc: usize = 0;
+    var alloc_tracker: [max_argv]bool = .{false} ** max_argv;
 
-    argv_buf[argc] = "/usr/local/bin/curl";
-    argc += 1;
-    argv_buf[argc] = "--fail-with-body";
-    argc += 1;
-    argv_buf[argc] = "-s";
-    argc += 1;
-    argv_buf[argc] = "-o";
-    argc += 1;
-    argv_buf[argc] = out_path;
-    argc += 1;
-    argv_buf[argc] = "-F";
-    argc += 1;
-    argv_buf[argc] = file_form;
-    argc += 1;
+    var token_iter = std.mem.splitScalar(u8, command_template, ' ');
+    while (token_iter.next()) |token| {
+        if (token.len == 0) continue;
+        if (argc >= max_argv) break;
 
-    // For align stage, add transcript form field
-    var transcript_form_buf: [512]u8 = undefined;
-    if (stage == .alignment) {
-        if (transcript_path) |tp| {
-            const tf = std.fmt.bufPrint(&transcript_form_buf, "transcript=<{s}", .{tp}) catch unreachable;
-            argv_buf[argc] = "-F";
-            argc += 1;
-            argv_buf[argc] = tf;
-            argc += 1;
-        }
+        const expanded = expandVar(allocator, token, job_id, audio_path, output_path_raw) catch |err| {
+            log.err("[{s}] template expansion failed: {}", .{ job_id, err });
+            // Free any previously allocated argv entries
+            for (argv_buf[0..argc], alloc_tracker[0..argc]) |arg, was_alloc| {
+                if (was_alloc) allocator.free(arg);
+            }
+            publishFailed(conn, job_id, stage_name, "template expansion failed");
+            return null;
+        };
+        argv_buf[argc] = expanded.str;
+        alloc_tracker[argc] = expanded.allocated;
+        argc += 1;
     }
 
-    argv_buf[argc] = url;
-    argc += 1;
+    if (argc == 0) {
+        log.err("[{s}] empty command after expansion", .{job_id});
+        publishFailed(conn, job_id, stage_name, "empty command");
+        return null;
+    }
 
     const argv = argv_buf[0..argc];
 
+    // Spawn child process
     var child = std.process.Child.init(argv, allocator);
     child.stderr_behavior = .Ignore;
     child.stdout_behavior = .Ignore;
 
     child.spawn() catch |err| {
-        log.err("[{s}] curl spawn failed for {s}: {}", .{ job_id, stage_name, err });
-        publishFailed(conn, job_id, stage, "curl spawn failed");
+        log.err("[{s}] spawn failed: {}", .{ job_id, err });
+        publishFailed(conn, job_id, stage_name, "spawn failed");
+        for (argv_buf[0..argc], alloc_tracker[0..argc]) |arg, was_alloc| {
+            if (was_alloc) allocator.free(arg);
+        }
         return null;
     };
 
+    // Free expanded argv (child has inherited/copied the data)
+    for (argv_buf[0..argc], alloc_tracker[0..argc]) |arg, was_alloc| {
+        if (was_alloc) allocator.free(arg);
+    }
+
     const child_pid: posix.pid_t = @intCast(child.id);
-    log.info("[{s}] curl spawned for {s} (pid {d})", .{ job_id, stage_name, child_pid });
+    log.info("[{s}] spawned pid {d}", .{ job_id, child_pid });
 
-    registerKqueue(kq, child_pid, job_id);
-
-    return ActiveJob{
-        .child_pid = child_pid,
-        .job_id = job_id,
-        .stage = stage,
-        .out_path = out_path,
-        .cleanup_paths = .{ null, null, null, null },
-    };
-}
-
-/// Register child PID with kqueue for exit notification.
-fn registerKqueue(kq: i32, child_pid: posix.pid_t, job_id: []const u8) void {
+    // Register for kqueue exit notification
     const change = posix.Kevent{
         .ident = @intCast(child_pid),
         .filter = c.EVFILT.PROC,
@@ -519,64 +382,111 @@ fn registerKqueue(kq: i32, child_pid: posix.pid_t, job_id: []const u8) void {
     _ = posix.kevent(kq, &.{change}, &.{}, null) catch |err| {
         log.err("[{s}] kevent register failed: {}", .{ job_id, err });
     };
-}
 
-/// Called when a child process exits. Handles output and publishes completion event.
-fn completeJob(
-    allocator: std.mem.Allocator,
-    conn: *nats.Connection,
-    job: *const ActiveJob,
-    exit_code: u32,
-) !void {
-    _ = allocator;
-    const stage_name = @tagName(job.stage);
-
-    if (exit_code != 0) {
-        log.err("[{s}] {s} exited with code {d}", .{ job.job_id, stage_name, exit_code });
-        var err_buf: [128]u8 = undefined;
-        const err_detail = std.fmt.bufPrint(&err_buf, "{s} exit {d}", .{ stage_name, exit_code }) catch "process failed";
-        publishFailed(conn, job.job_id, job.stage, err_detail);
-        return;
-    }
-
-    // For whisper stage: move output from tmp to output_dir
-    if (job.stage == .whisper) {
-        // whisper-cli writes to {cleanup_paths[0]}.json (out_base.json)
-        if (job.cleanup_paths[0]) |out_base| {
-            var src_buf: [512]u8 = undefined;
-            const src_path = std.fmt.bufPrint(&src_buf, "{s}.json", .{out_base}) catch unreachable;
-            std.fs.cwd().rename(src_path, job.out_path) catch |err| {
-                log.err("[{s}] failed to move whisper output: {}", .{ job.job_id, err });
-                publishFailed(conn, job.job_id, job.stage, "failed to move output file");
-                return;
-            };
-        }
-    }
-    // For curl stages (pyannote, align): output already written directly to out_path by curl -o
-
-    log.info("[{s}] {s} done, output at {s}", .{ job.job_id, stage_name, job.out_path });
-
-    // Publish completion event with stage info
-    var evt_buf: [768]u8 = undefined;
-    const evt = std.fmt.bufPrint(&evt_buf,
-        "{{\"job_id\":\"{s}\",\"stage\":\"{s}\",\"status\":\"completed\",\"output_path\":\"{s}\"}}",
-        .{ job.job_id, stage_name, job.out_path },
-    ) catch unreachable;
-    conn.publish(subject_completed, evt) catch |err| {
-        log.err("[{s}] failed to publish completion: {}", .{ job.job_id, err });
+    return ActiveJob{
+        .child_pid = child_pid,
+        .job_id = job_id,
+        .stage_name = stage_name,
+        .output_path = output_path,
     };
 }
 
+const ExpandResult = struct {
+    str: []const u8,
+    allocated: bool,
+};
+
+/// Expand {audio_path}, {output_path}, {job_id} in a single token.
+fn expandVar(allocator: std.mem.Allocator, token: []const u8, job_id: []const u8, audio_path: []const u8, output_path: []const u8) !ExpandResult {
+    if (std.mem.eql(u8, token, "{audio_path}")) {
+        return .{ .str = audio_path, .allocated = false };
+    }
+    if (std.mem.eql(u8, token, "{output_path}")) {
+        return .{ .str = output_path, .allocated = false };
+    }
+    if (std.mem.eql(u8, token, "{job_id}")) {
+        return .{ .str = job_id, .allocated = false };
+    }
+    // Check for embedded variables (e.g., prefix{job_id}suffix)
+    if (std.mem.indexOf(u8, token, "{")) |_| {
+        // Calculate total size needed
+        var total_len: usize = 0;
+        var pos: usize = 0;
+        while (pos < token.len) {
+            if (token[pos] == '{') {
+                const end = std.mem.indexOfScalarPos(u8, token, pos, '}') orelse {
+                    total_len += 1;
+                    pos += 1;
+                    continue;
+                };
+                const var_name = token[pos + 1 .. end];
+                if (std.mem.eql(u8, var_name, "audio_path")) {
+                    total_len += audio_path.len;
+                } else if (std.mem.eql(u8, var_name, "output_path")) {
+                    total_len += output_path.len;
+                } else if (std.mem.eql(u8, var_name, "job_id")) {
+                    total_len += job_id.len;
+                } else {
+                    total_len += (end - pos + 1);
+                }
+                pos = end + 1;
+            } else {
+                total_len += 1;
+                pos += 1;
+            }
+        }
+
+        // Build the expanded string
+        const buf = try allocator.alloc(u8, total_len);
+        var write_pos: usize = 0;
+        pos = 0;
+        while (pos < token.len) {
+            if (token[pos] == '{') {
+                const end = std.mem.indexOfScalarPos(u8, token, pos, '}') orelse {
+                    buf[write_pos] = token[pos];
+                    write_pos += 1;
+                    pos += 1;
+                    continue;
+                };
+                const var_name = token[pos + 1 .. end];
+                const replacement: []const u8 = if (std.mem.eql(u8, var_name, "audio_path"))
+                    audio_path
+                else if (std.mem.eql(u8, var_name, "output_path"))
+                    output_path
+                else if (std.mem.eql(u8, var_name, "job_id"))
+                    job_id
+                else blk: {
+                    const literal = token[pos .. end + 1];
+                    @memcpy(buf[write_pos .. write_pos + literal.len], literal);
+                    write_pos += literal.len;
+                    pos = end + 1;
+                    break :blk "";
+                };
+                if (replacement.len > 0) {
+                    @memcpy(buf[write_pos .. write_pos + replacement.len], replacement);
+                    write_pos += replacement.len;
+                    pos = end + 1;
+                }
+            } else {
+                buf[write_pos] = token[pos];
+                write_pos += 1;
+                pos += 1;
+            }
+        }
+        return .{ .str = buf[0..write_pos], .allocated = true };
+    }
+    return .{ .str = token, .allocated = false };
+}
+
 /// Publish a failure event to the pipeline completion subject.
-fn publishFailed(conn: *nats.Connection, job_id: []const u8, stage: Stage, reason: []const u8) void {
+fn publishFailed(conn: *nats.Connection, job_id: []const u8, stage_name: []const u8, reason: []const u8) void {
     var buf: [768]u8 = undefined;
     const evt = std.fmt.bufPrint(&buf,
         "{{\"job_id\":\"{s}\",\"stage\":\"{s}\",\"status\":\"failed\",\"error\":\"{s}\"}}",
-        .{ job_id, @tagName(stage), reason },
+        .{ job_id, stage_name, reason },
     ) catch return;
     conn.publish(subject_completed, evt) catch {};
 }
-
 
 fn getStr(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     const val = obj.get(key) orelse return null;

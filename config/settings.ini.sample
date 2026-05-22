@@ -10,13 +10,11 @@ host = 127.0.0.1
 port = 4222
 
 [worker]
-; pherb-worker handles all ML stages (whisper, pyannote, wav2vec2) via NATS.
-; All stages write output to the shared output_path directory.
-; Consumer dispatches to pherb.worker.{whisper,pyannote,align} and listens
-; on pherb.pipeline.completed for stage results.
-;
-; The worker config (pyannote_url, wav2vec2_url) lives in the worker binary
-; itself — the consumer does not need these URLs.
+; pherb-worker is a generic NATS-to-process bridge. It subscribes to subjects
+; defined in its own config (worker.conf) and runs configured commands.
+; The consumer dispatches to pherb.worker.{convert,whisper,pyannote,align}
+; with audio_path + output_path in the payload. Workers can be deployed in
+; any jail or host — they just need NATS access and shared storage.
 
 [storage]
 audio_path = /data/audio

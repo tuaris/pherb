@@ -11,7 +11,11 @@ use Basis\Nats\Configuration as NatsConfiguration;
  * The worker processes each stage independently and publishes completion events
  * to pherb.pipeline.completed, which the consumer listens for.
  *
+ * The consumer (orchestrator) owns all paths. Every dispatch includes both
+ * audio_path and output_path so workers never compute paths internally.
+ *
  * Subjects:
+ *   pherb.worker.convert   — audio format conversion stage
  *   pherb.worker.whisper   — transcription stage
  *   pherb.worker.pyannote  — speaker diarization stage
  *   pherb.worker.align     — forced alignment stage
@@ -28,37 +32,50 @@ class PipelineDispatcher
     }
 
     /**
+     * Dispatch audio conversion stage (ffmpeg → WAV).
+     */
+    public function dispatchConvert(string $jobId, string $audioPath, string $outputPath): void
+    {
+        $this->publish('pherb.worker.convert', [
+            'job_id' => $jobId,
+            'audio_path' => $audioPath,
+            'output_path' => $outputPath,
+        ]);
+    }
+
+    /**
      * Dispatch whisper transcription stage.
      */
-    public function dispatchWhisper(string $jobId, string $audioPath, string $model = 'medium.en'): void
+    public function dispatchWhisper(string $jobId, string $audioPath, string $outputPath): void
     {
         $this->publish('pherb.worker.whisper', [
             'job_id' => $jobId,
             'audio_path' => $audioPath,
-            'model' => $model,
+            'output_path' => $outputPath,
         ]);
     }
 
     /**
      * Dispatch pyannote diarization stage.
      */
-    public function dispatchPyannote(string $jobId, string $audioPath): void
+    public function dispatchPyannote(string $jobId, string $audioPath, string $outputPath): void
     {
         $this->publish('pherb.worker.pyannote', [
             'job_id' => $jobId,
             'audio_path' => $audioPath,
+            'output_path' => $outputPath,
         ]);
     }
 
     /**
      * Dispatch wav2vec2 forced alignment stage.
      */
-    public function dispatchAlignment(string $jobId, string $audioPath, string $transcriptPath): void
+    public function dispatchAlignment(string $jobId, string $audioPath, string $outputPath): void
     {
         $this->publish('pherb.worker.align', [
             'job_id' => $jobId,
             'audio_path' => $audioPath,
-            'transcript_path' => $transcriptPath,
+            'output_path' => $outputPath,
         ]);
     }
 

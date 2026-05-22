@@ -72,19 +72,19 @@ class PherbConsumer
     }
 
     /**
-     * Dispatch a new job — starts the pipeline at the whisper stage.
+     * Dispatch a new job — starts the pipeline at the convert stage.
      */
     private function dispatchJob(string $jobId, string $audioPath, array $options): void
     {
         $fullPath = $this->audioBasePath . '/' . ltrim($audioPath, '/');
-        $model = $options['model'] ?? 'medium.en';
 
         if (!file_exists($fullPath)) {
             throw new \RuntimeException("Audio file not found: {$fullPath}");
         }
 
-        $this->logDaemon("[{$jobId}] Dispatching whisper stage: {$audioPath} (model={$model})");
-        $this->dispatcher->dispatchWhisper($jobId, $fullPath, $model);
+        $convertOutput = $this->outputPath . "/{$jobId}.convert.wav";
+        $this->logDaemon("[{$jobId}] Dispatching convert stage: {$audioPath}");
+        $this->dispatcher->dispatchConvert($jobId, $fullPath, $convertOutput);
     }
 
     /**
@@ -142,7 +142,8 @@ class PherbConsumer
      * Advance the pipeline after a stage completes.
      *
      * State machine:
-     *   whisper completed → dispatch pyannote (if diarize=true) OR finalize
+     *   convert completed  → dispatch whisper
+     *   whisper completed  → dispatch pyannote (if diarize=true) OR finalize
      *   pyannote completed → dispatch alignment (if align=true) OR finalize
      *   alignment completed → finalize
      */
@@ -155,30 +156,38 @@ class PherbConsumer
         }
 
         $opts = is_array($job['options']) ? $job['options'] : (json_decode($job['options'] ?? '{}', true) ?: []);
-        $audioPath = $job['audio_path'] ?? '';
-        $fullPath = $this->audioBasePath . '/' . ltrim($audioPath, '/');
         $diarize = (bool)($opts['diarize'] ?? true);
         $align = (bool)($opts['align'] ?? false);
 
+        // The converted WAV is the audio input for all subsequent stages
+        $wavPath = $this->outputPath . "/{$jobId}.convert.wav";
+
         switch ($completedStage) {
+            case 'convert':
+                $whisperOutput = $this->outputPath . "/{$jobId}.whisper.json";
+                $this->logDaemon("[{$jobId}] Dispatching whisper stage");
+                $this->dispatcher->dispatchWhisper($jobId, $wavPath, $whisperOutput);
+                break;
+
             case 'whisper':
-                if ($diarize && file_exists($fullPath)) {
+                if ($diarize) {
+                    $pyannoteOutput = $this->outputPath . "/{$jobId}.pyannote.json";
                     $this->logDaemon("[{$jobId}] Dispatching pyannote stage");
-                    $this->dispatcher->dispatchPyannote($jobId, $fullPath);
-                } elseif ($align && file_exists($fullPath)) {
-                    $whisperOut = $this->outputPath . "/{$jobId}.whisper.json";
+                    $this->dispatcher->dispatchPyannote($jobId, $wavPath, $pyannoteOutput);
+                } elseif ($align) {
+                    $alignOutput = $this->outputPath . "/{$jobId}.align.json";
                     $this->logDaemon("[{$jobId}] Dispatching alignment stage");
-                    $this->dispatcher->dispatchAlignment($jobId, $fullPath, $whisperOut);
+                    $this->dispatcher->dispatchAlignment($jobId, $wavPath, $alignOutput);
                 } else {
                     $this->finalizePipeline($jobId);
                 }
                 break;
 
             case 'pyannote':
-                if ($align && file_exists($fullPath)) {
-                    $whisperOut = $this->outputPath . "/{$jobId}.whisper.json";
+                if ($align) {
+                    $alignOutput = $this->outputPath . "/{$jobId}.align.json";
                     $this->logDaemon("[{$jobId}] Dispatching alignment stage");
-                    $this->dispatcher->dispatchAlignment($jobId, $fullPath, $whisperOut);
+                    $this->dispatcher->dispatchAlignment($jobId, $wavPath, $alignOutput);
                 } else {
                     $this->finalizePipeline($jobId);
                 }
@@ -282,6 +291,8 @@ class PherbConsumer
         $this->logDaemon("[{$jobId}] Final output written: {$outputFile}");
 
         // Clean up intermediate stage outputs
+        $convertFile = $this->outputPath . "/{$jobId}.convert.wav";
+        @unlink($convertFile);
         @unlink($whisperFile);
         @unlink($pyannoteFile);
         @unlink($alignFile);

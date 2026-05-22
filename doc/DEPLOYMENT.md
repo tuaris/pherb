@@ -1,59 +1,97 @@
 # Pherb Deployment Guide
 
-Pherb is designed to run on FreeBSD with a jail-based architecture. The worker
-runs on the host (alongside whisper-cli and audio models), while the consumer,
-API, and supporting services each run in their own jail.
+Pherb is designed to run on FreeBSD with a jail-based architecture. Workers
+are generic NATS-to-process bridges deployed in each jail alongside their
+respective ML tools. The consumer (orchestrator) runs in its own jail and
+coordinates the pipeline via NATS messages.
 
 ## Components
 
 | Component | Location | Description |
 |-----------|----------|-------------|
-| pherb-worker | Host: `/usr/local/bin/pherb-worker` | Multi-stage ML pipeline worker (Zig binary) |
-| pherb-consumer | Jail: `/usr/local/libexec/pherb/` | NATS JetStream consumer daemon (PHP) |
+| pherb-worker | Any jail/host | Generic command executor (Zig binary) |
+| pherb-consumer | Jail: `/usr/local/libexec/pherb/` | Pipeline orchestrator daemon (PHP) |
 | pherb-api | Jail: `/usr/local/www/pherb/` | REST API (PHP, Apache) |
-| whisper-cli | Host: `/usr/local/bin/whisper-cli` | Speech-to-text engine |
-| pyannote | Jail: FastAPI on `:9090` | Speaker diarization service |
-| wav2vec2 | Jail: FastAPI on `:9091` | Forced alignment service |
 | NATS | Jail: `:4222` | Message broker with JetStream |
 | MariaDB | Jail: `:3306` | Job database |
 | HAProxy | Host | TLS termination and routing |
 
+## Architecture
+
+The worker is stage-agnostic. Each deployment instance subscribes to the
+NATS subjects defined in its `worker.conf` and runs the configured command.
+The consumer (orchestrator) owns all paths and pipeline logic.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ Consumer (orchestrator)                                          │
+│   - Owns all file paths                                          │
+│   - Dispatches stages with {audio_path, output_path, job_id}    │
+│   - Advances pipeline on completion events                       │
+│   - Merges + formats final output                                │
+└───────────┬──────────────┬──────────────┬──────────────┬────────┘
+            │              │              │              │
+    ┌───────▼──────┐ ┌────▼─────┐ ┌──────▼──────┐ ┌────▼────┐
+    │ convert      │ │ whisper  │ │ pyannote    │ │ align   │
+    │ worker       │ │ worker   │ │ worker      │ │ worker  │
+    │ (any jail)   │ │ (GPU host)│ │ (GPU jail)  │ │ (jail)  │
+    └──────────────┘ └──────────┘ └─────────────┘ └─────────┘
+```
+
 ## Jails
 
-Six jails, all using `ip4=inherit` (shared host IP):
+| Jail | Purpose | Audio Mount |
+|------|---------|-------------|
+| pherb | Consumer + API (PHP, Apache) | /data/audio (rw) |
+| webdav | Audio upload/download | /data/audio (rw) |
+| nats | NATS JetStream | — |
+| mariadb | MariaDB | — |
+| whisper | pherb-worker + whisper-cli + models | /data/audio (rw) |
+| pyannote | pherb-worker + pyannote (Python) | /data/audio (rw) |
+| wav2vec2 | pherb-worker + wav2vec2 (Python) | /data/audio (rw) |
 
-| Jail | Purpose | Port | Audio Mount |
-|------|---------|------|-------------|
-| pherb | Consumer + API (PHP, Apache) | 8082 | /data/audio (rw) |
-| webdav | Audio upload/download | 8081 | /data/audio (rw) |
-| nats | NATS JetStream | 4222 | — |
-| mariadb | MariaDB | 3306 | — |
-| pyannote | Speaker diarization (Python venv) | 9090 | /data/audio (ro) |
-| wav2vec2 | Forced alignment (Python venv) | 9091 | /data/audio (ro) |
+Workers can also run on remote hosts (GPU machines) connected via NATS +
+NFS-mounted shared storage.
 
 ## NATS Subjects
 
 | Subject | Type | Purpose |
 |---------|------|---------|
 | `pherb.jobs.transcribe` | JetStream (PHERB stream) | New job requests (API → consumer) |
-| `pherb.worker.whisper` | Plain NATS | Consumer → worker: transcription stage |
-| `pherb.worker.pyannote` | Plain NATS | Consumer → worker: diarization stage |
-| `pherb.worker.align` | Plain NATS | Consumer → worker: alignment stage |
-| `pherb.pipeline.completed` | Plain NATS | Worker → consumer: stage completion events |
+| `pherb.worker.convert` | Plain NATS | Consumer → worker: audio conversion |
+| `pherb.worker.whisper` | Plain NATS | Consumer → worker: transcription |
+| `pherb.worker.pyannote` | Plain NATS | Consumer → worker: speaker diarization |
+| `pherb.worker.align` | Plain NATS | Consumer → worker: forced alignment |
+| `pherb.pipeline.completed` | Plain NATS | Worker → consumer: stage completion |
 | `pherb.worker.status` | Plain NATS req/reply | Stale job detection |
+
+## NATS Payload Contract
+
+**Dispatch (consumer → worker):**
+```json
+{"job_id": "abc123", "audio_path": "/data/audio/file.wav", "output_path": "/data/audio/outputs/abc123.whisper.json"}
+```
+
+**Completion (worker → consumer):**
+```json
+{"job_id": "abc123", "stage": "whisper", "status": "completed", "output_path": "/data/audio/outputs/abc123.whisper.json"}
+```
 
 ## Pipeline Flow
 
 ```
 API POST /jobs → JetStream (pherb.jobs.transcribe)
+  → Consumer dispatches pherb.worker.convert
+    → Worker runs ffmpeg, writes .convert.wav
+    → Worker publishes pherb.pipeline.completed {stage: "convert"}
   → Consumer dispatches pherb.worker.whisper
-    → Worker spawns whisper-cli (kqueue monitors child)
+    → Worker runs whisper-cli, writes .whisper.json
     → Worker publishes pherb.pipeline.completed {stage: "whisper"}
   → Consumer dispatches pherb.worker.pyannote (if diarize=true)
-    → Worker spawns curl → pyannote FastAPI
+    → Worker runs pyannote, writes .pyannote.json
     → Worker publishes pherb.pipeline.completed {stage: "pyannote"}
   → Consumer dispatches pherb.worker.align (if align=true)
-    → Worker spawns curl → wav2vec2 FastAPI
+    → Worker runs wav2vec2, writes .align.json
     → Worker publishes pherb.pipeline.completed {stage: "alignment"}
   → Consumer finalizes: merge outputs, format, write result, mark completed
 ```
@@ -67,15 +105,22 @@ ZFS dataset `models/audio` mounted at `/data/audio` (lz4 compression):
 /data/audio/outputs/      — stage outputs + final results
 ```
 
-nullfs-mounted into jails: pherb (rw), webdav (rw), pyannote (ro), wav2vec2 (ro).
+nullfs-mounted into all worker jails (rw) and webdav (rw).
 
 ## Configuration
 
-- **Worker**: no config file — uses compiled defaults (NATS `127.0.0.1:4222`,
-  whisper-cli at `/usr/local/bin/whisper-cli`, models at `/models/whisper`,
-  output at `/data/audio/outputs`)
+- **Worker**: `/usr/local/etc/pherb/worker.conf` (per-jail, defines stages)
 - **Consumer**: `/usr/local/etc/pherb/settings.ini` (symlinked into libexec)
 - **API**: same settings.ini via Apache in pherb jail
+
+### Example worker.conf (pyannote jail)
+
+```ini
+nats_url = nats://nats.freebsd-dev1.morante.com:4222
+
+[stages]
+pherb.worker.pyannote = /usr/local/bin/python3 /usr/local/libexec/pherb/pherb-diarize.py {audio_path} {output_path}
+```
 
 ## RC Services
 
