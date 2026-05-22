@@ -262,7 +262,7 @@ fn spawnWhisper(
     const model_path = std.fmt.bufPrint(&model_path_buf, "{s}/ggml-{s}.bin", .{ config.models_dir, model }) catch unreachable;
 
     var out_base_buf: [512]u8 = undefined;
-    const out_base_slice = std.fmt.bufPrint(&out_base_buf, "/tmp/pherb_whisper_{s}", .{job_id}) catch unreachable;
+    const out_base_slice = std.fmt.bufPrint(&out_base_buf, "{s}/.tmp_whisper_{s}", .{ config.output_dir, job_id }) catch unreachable;
 
     // Output destination
     var out_path_buf: [512]u8 = undefined;
@@ -283,7 +283,7 @@ fn spawnWhisper(
             break :blk audio_path;
         }
         var wav_buf: [512]u8 = undefined;
-        const wp_slice = std.fmt.bufPrint(&wav_buf, "/tmp/pherb_wav_{s}.wav", .{job_id}) catch unreachable;
+        const wp_slice = std.fmt.bufPrint(&wav_buf, "{s}/.tmp_wav_{s}.wav", .{ config.output_dir, job_id }) catch unreachable;
         const wp = try allocator.dupe(u8, wp_slice);
 
         log.info("[{s}] converting to WAV...", .{job_id});
