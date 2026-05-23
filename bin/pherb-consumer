@@ -562,6 +562,7 @@ class PherbConsumer
                     $stream = $client->getApi()->getStream('PHERB');
                     $stream->getConfiguration()->setSubjects(['pherb.jobs.>', 'pherb.pipeline.>']);
                     $stream->createIfNotExists();
+                    $stream->update();
 
                     // Durable consumer for new jobs — deferred ACK (ack_wait=120s)
                     $jobConsumer = $stream->getConsumer('pherb-jobs');
