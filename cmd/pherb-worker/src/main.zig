@@ -8,7 +8,6 @@ const log = std.log.scoped(.pherb_worker);
 
 pub const version = "0.7.0";
 
-const subject_status = "pherb.worker.status";
 const subject_completed = "pherb.pipeline.completed";
 
 const max_stages = 16;
@@ -194,15 +193,10 @@ pub fn main() !void {
         };
         defer msg.deinit();
 
-        // Status request
-        if (std.mem.eql(u8, msg.subject, subject_status)) {
-            handleStatus(&conn, msg, active_job);
-            continue;
-        }
-
-        // Reply busy if already processing
-        if (active_job) |job| {
-            replyBusy(&conn, &job);
+        // Ignore messages while busy — worker processes one job at a time.
+        // The dispatching consumer holds the JetStream message and sends
+        // InProgress heartbeats; no busy reply needed.
+        if (active_job != null) {
             continue;
         }
 
@@ -273,27 +267,6 @@ fn checkChildExit(kq: i32, allocator: std.mem.Allocator, conn: *nats.Connection,
     allocator.free(job.output_path);
     if (job.post_rename) |pr| allocator.free(pr);
     return true;
-}
-
-/// Handle pherb.worker.status request — reply with current worker state.
-fn handleStatus(conn: *nats.Connection, msg: *nats.Message, active_job: ?ActiveJob) void {
-    const reply_to = msg.reply orelse return;
-
-    if (active_job) |job| {
-        var buf: [256]u8 = undefined;
-        const status = std.fmt.bufPrint(&buf, "{{\"status\":\"busy\",\"job_id\":\"{s}\",\"stage\":\"{s}\",\"pid\":{d}}}", .{ job.job_id, job.stage_name, job.child_pid }) catch return;
-        conn.publish(reply_to, status) catch {};
-    } else {
-        conn.publish(reply_to, "{\"status\":\"idle\"}") catch {};
-    }
-}
-
-/// Publish busy status to the completion subject.
-fn replyBusy(conn: *nats.Connection, job: *const ActiveJob) void {
-    var buf: [512]u8 = undefined;
-    const busy = std.fmt.bufPrint(&buf, "{{\"status\":\"busy\",\"active_job\":\"{s}\",\"stage\":\"{s}\"}}", .{ job.job_id, job.stage_name }) catch return;
-    conn.publish(subject_completed, busy) catch {};
-    log.info("busy ({s}), active job {s}", .{ job.stage_name, job.job_id });
 }
 
 /// Spawn a job: config provides base argv (binary), payload provides args array.

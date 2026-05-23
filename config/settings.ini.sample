@@ -23,5 +23,3 @@ output_path = /data/audio/outputs
 [cleanup]
 ; Delete completed/failed jobs older than this many days
 ttl_days = 7
-; How often to run cleanup (in minutes)
-interval_minutes = 60

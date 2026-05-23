@@ -39,9 +39,11 @@ class PherbConsumer
     private string $natsHost;
     private int $natsPort;
     private int $cleanupTtlDays;
-    private int $cleanupIntervalMin;
-    private int $lastCleanupTime = 0;
     private ?IniConfig $settings;
+
+    /** @var array<string, object> JetStream messages held until pipeline completes */
+    private array $activeMessages = [];
+    private int $lastCleanupTime = 0;
 
     public function __construct(?IniConfig $settings = null)
     {
@@ -57,7 +59,6 @@ class PherbConsumer
 
         // Cleanup
         $this->cleanupTtlDays = (int)(getenv('CLEANUP_TTL_DAYS') ?: ($settings ? $settings->getInt('cleanup', 'ttl_days', 7) : 7));
-        $this->cleanupIntervalMin = (int)(getenv('CLEANUP_INTERVAL_MIN') ?: ($settings ? $settings->getInt('cleanup', 'interval_minutes', 60) : 60));
 
         // Initialize service clients
         $this->dispatcher = new PipelineDispatcher($this->natsHost, $this->natsPort);
@@ -88,12 +89,16 @@ class PherbConsumer
     }
 
     /**
-     * Handle pipeline stage completion events.
+     * Handle pipeline stage completion events from JetStream.
      *
      * The worker publishes to pherb.pipeline.completed with a stage field.
-     * This method routes to the next stage or finalizes the job.
+     * JetStream captures it durably. This method routes to the next stage
+     * or finalizes the job, then ACKs the completion message.
+     *
+     * On terminal events (failure or final stage), also ACKs and removes
+     * the held job message from $activeMessages.
      */
-    private function handlePipelineCompleted(array $event): void
+    private function handlePipelineCompleted(array $event, object $completionMessage): void
     {
         $jobId = $event['job_id'] ?? '';
         $status = $event['status'] ?? '';
@@ -102,26 +107,23 @@ class PherbConsumer
 
         if (empty($jobId)) {
             $this->logDaemon("Ignoring completion event with missing job_id");
+            $completionMessage->ack();
             return;
         }
 
-        // Handle busy replies
-        if ($status === 'busy') {
-            $this->logDaemon("[{$jobId}] Worker busy ({$stage}), will retry on next cycle");
-            return;
-        }
-
-        // Handle stage failure
+        // Handle stage failure — terminal event
         if ($status === 'failed') {
             $error = $event['error'] ?? 'unknown error';
             $this->logDaemon("[{$jobId}] Stage '{$stage}' failed: {$error}");
             $this->jobStore->markFailed($jobId, ucfirst($stage) . ": {$error}");
             $this->incrementMetric('errors');
+            $this->ackAndRelease($jobId, $completionMessage);
             return;
         }
 
         if ($status !== 'completed' || empty($outputPath)) {
             $this->logDaemon("[{$jobId}] Unexpected status from stage '{$stage}': {$status}");
+            $completionMessage->ack();
             return;
         }
 
@@ -133,9 +135,30 @@ class PherbConsumer
             $this->logDaemon("[{$jobId}] Pipeline advance FAILED: " . $e->getMessage());
             $this->jobStore->markFailed($jobId, $e->getMessage());
             $this->incrementMetric('errors');
+            $this->ackAndRelease($jobId, $completionMessage);
+            return;
         }
 
+        // ACK the completion event (stage processed successfully)
+        $completionMessage->ack();
         $this->recordActivity();
+    }
+
+    /**
+     * ACK completion message and release the held job message.
+     *
+     * Called on terminal events (pipeline complete or failed) to ACK
+     * both the completion event and the original job message, allowing
+     * JetStream to remove them from the stream.
+     */
+    private function ackAndRelease(string $jobId, object $completionMessage): void
+    {
+        $completionMessage->ack();
+
+        if (isset($this->activeMessages[$jobId])) {
+            $this->activeMessages[$jobId]->ack();
+            unset($this->activeMessages[$jobId]);
+        }
     }
 
     /**
@@ -305,6 +328,12 @@ class PherbConsumer
         $this->incrementMetric('processed');
         echo "[" . date('H:i:s') . "] Job {$jobId} completed\n";
 
+        // ACK and release the held JetStream job message — pipeline complete
+        if (isset($this->activeMessages[$jobId])) {
+            $this->activeMessages[$jobId]->ack();
+            unset($this->activeMessages[$jobId]);
+        }
+
         // Webhook callback
         $job = $this->jobStore->get($jobId);
         if (!empty($job['callback_url'])) {
@@ -460,66 +489,6 @@ class PherbConsumer
     }
 
     /**
-     * Deterministic stale job recovery via NATS status check.
-     *
-     * Queries the whisper-worker via pherb.whisper.status to determine
-     * if jobs stuck in 'processing' are genuinely alive or stale.
-     * Replaces the timer-based recoverStaleJobs(30min) guessing.
-     *
-     * @return int Number of stale jobs recovered
-     */
-    private function recoverStaleJobsViaNats(): int
-    {
-        $processing = $this->jobStore->listRecent(50, 'processing');
-        if (empty($processing)) {
-            return 0;
-        }
-
-        // Query whisper-worker status via a short-lived NATS connection
-        $workerStatus = null;
-        try {
-            $config = new NatsConfiguration(
-                host: $this->natsHost,
-                port: $this->natsPort,
-                timeout: 5.0,
-            );
-            $statusClient = new NatsClient($config);
-            $statusClient->setName('pherb-stale-checker');
-            $statusClient->request('pherb.worker.status', '', function ($response) use (&$workerStatus) {
-                $body = $response->body ?? (string)$response;
-                $workerStatus = json_decode($body, true);
-            });
-            $statusClient->disconnect();
-        } catch (\Throwable $e) {
-            // Worker unreachable — all processing jobs are stale
-            $this->logDaemon("Whisper worker unreachable for status check: " . $e->getMessage());
-            $workerStatus = ['status' => 'unreachable'];
-        }
-
-        $recovered = 0;
-        foreach ($processing as $job) {
-            $jobId = $job['id'];
-
-            // If worker is busy with THIS job, it's alive — skip
-            if (is_array($workerStatus)
-                && ($workerStatus['status'] ?? '') === 'busy'
-                && ($workerStatus['job_id'] ?? '') === $jobId
-            ) {
-                continue;
-            }
-
-            // Worker is idle, busy with a different job, or unreachable — this job is stale
-            $rows = $this->jobStore->markFailed($jobId, 'Stale: whisper worker not processing this job');
-            if ($rows > 0) {
-                $this->logDaemon("[{$jobId}] Marked stale (worker status: " . ($workerStatus['status'] ?? 'unknown') . ")");
-                $recovered++;
-            }
-        }
-
-        return $recovered;
-    }
-
-    /**
      * Create and connect NATS JetStream client.
      */
     private function createNatsClient(): NatsClient
@@ -542,6 +511,17 @@ class PherbConsumer
 
     /**
      * Main run loop.
+     *
+     * Architecture: NATS-idiomatic with deferred ACK.
+     *
+     * - Job messages are held (not ACKed) until the entire pipeline completes.
+     *   JetStream ack_wait + InProgress() heartbeats prevent redelivery while
+     *   the pipeline is alive. If the consumer dies, ack_wait expires and
+     *   JetStream redelivers automatically — no stale check needed.
+     *
+     * - Completion events are durable via JetStream (not ephemeral plain NATS).
+     *   If the consumer disconnects mid-pipeline, completions wait in the stream
+     *   and are delivered when the consumer reconnects.
      */
     public function run(): int
     {
@@ -568,66 +548,98 @@ class PherbConsumer
 
         // Connect to NATS
         $client = null;
-        $queue = null;
+        $jobQueue = null;
+        $completionQueue = null;
         $reconnectDelay = 1;
 
         while ($this->daemonTick()) {
-            // Ensure NATS connection + JetStream consumer + completion subscription
-            if ($client === null || $queue === null) {
+            // Ensure NATS connection + JetStream consumers
+            if ($client === null || $jobQueue === null || $completionQueue === null) {
                 try {
                     $client = $this->createNatsClient();
 
-                    // Get or create stream + durable consumer for new jobs
+                    // Get or create stream capturing both jobs and pipeline events
                     $stream = $client->getApi()->getStream('PHERB');
-                    $stream->getConfiguration()->setSubjects(['pherb.jobs.>']);
+                    $stream->getConfiguration()->setSubjects(['pherb.jobs.>', 'pherb.pipeline.>']);
                     $stream->createIfNotExists();
 
-                    $consumer = $stream->getConsumer('pherb-worker');
-                    $consumerConfig = $consumer->getConfiguration();
-                    $consumerConfig->setAckWait(30_000_000_000); // 30s — dispatch is instant
-                    $consumerConfig->setMaxDeliver(3);
-                    $consumerConfig->setSubjectFilter('pherb.jobs.transcribe');
-                    $consumer->create();
+                    // Durable consumer for new jobs — deferred ACK (ack_wait=120s)
+                    $jobConsumer = $stream->getConsumer('pherb-jobs');
+                    $jobConfig = $jobConsumer->getConfiguration();
+                    $jobConfig->setAckWait(120_000_000_000); // 120s — InProgress extends this
+                    $jobConfig->setMaxDeliver(3);
+                    $jobConfig->setSubjectFilter('pherb.jobs.transcribe');
+                    $jobConsumer->create();
+                    $jobConsumer->setExpires(2.0);
+                    $jobConsumer->setBatching(1);
+                    $jobQueue = $jobConsumer->getQueue();
 
-                    $consumer->setExpires(2.0);
-                    $consumer->setBatching(1);
-                    $queue = $consumer->getQueue();
-
-                    // Subscribe to pipeline completion events (plain NATS, not JetStream)
-                    $client->subscribe('pherb.pipeline.completed', function ($msg) {
-                        $body = $msg->body ?? (string)$msg;
-                        $event = json_decode($body, true);
-                        if (is_array($event)) {
-                            $this->handlePipelineCompleted($event);
-                        }
-                    });
+                    // Durable consumer for pipeline completion events
+                    $completionConsumer = $stream->getConsumer('pherb-pipeline');
+                    $completionConfig = $completionConsumer->getConfiguration();
+                    $completionConfig->setAckWait(30_000_000_000); // 30s
+                    $completionConfig->setMaxDeliver(5);
+                    $completionConfig->setSubjectFilter('pherb.pipeline.completed');
+                    $completionConsumer->create();
+                    $completionConsumer->setExpires(2.0);
+                    $completionConsumer->setBatching(5);
+                    $completionQueue = $completionConsumer->getQueue();
 
                     $reconnectDelay = 1;
-                    echo "Connected to NATS, waiting for jobs + completions...\n\n";
+                    echo "Connected to NATS JetStream, waiting for jobs + completions...\n\n";
                 } catch (\Throwable $e) {
                     $this->logDaemon("NATS connect failed: " . $e->getMessage() . " (retry in {$reconnectDelay}s)");
                     $client = null;
-                    $queue = null;
+                    $jobQueue = null;
+                    $completionQueue = null;
                     sleep(min($reconnectDelay, 30));
                     $reconnectDelay *= 2;
                     continue;
                 }
             }
 
-            // 1. Process whisper completion events (non-blocking)
+            // 1. Process pipeline completion events from JetStream (durable)
             try {
-                $client->process(0);
+                $completions = $completionQueue->fetchAll(5);
             } catch (\Throwable $e) {
-                $this->logDaemon("NATS process error: " . $e->getMessage());
+                $this->logDaemon("Completion fetch error: " . $e->getMessage() . " (reconnecting)");
+                $client = null;
+                $jobQueue = null;
+                $completionQueue = null;
+                continue;
             }
 
-            // 2. Pull new jobs from JetStream and dispatch to whisper-worker
+            foreach ($completions as $completionMsg) {
+                $payload = $completionMsg->payload;
+                if ($payload->isEmpty()) {
+                    continue;
+                }
+
+                $event = json_decode($payload->body, true);
+                if (is_array($event)) {
+                    $this->handlePipelineCompleted($event, $completionMsg);
+                } else {
+                    $completionMsg->ack();
+                }
+            }
+
+            // 2. Send InProgress heartbeats for all held job messages
+            foreach ($this->activeMessages as $jobId => $heldMessage) {
+                try {
+                    $heldMessage->progress();
+                } catch (\Throwable $e) {
+                    $this->logDaemon("[{$jobId}] InProgress failed: " . $e->getMessage());
+                }
+            }
+
+            // 3. Pull new jobs from JetStream and dispatch first pipeline stage
             try {
-                $messages = $queue->fetchAll(1);
+                $messages = $jobQueue->fetchAll(1);
             } catch (\Throwable $e) {
-                $this->logDaemon("NATS fetch error: " . $e->getMessage() . " (reconnecting)");
+                $this->logDaemon("Job fetch error: " . $e->getMessage() . " (reconnecting)");
                 $client = null;
-                $queue = null;
+                $jobQueue = null;
+                $completionQueue = null;
                 continue;
             }
 
@@ -656,10 +668,10 @@ class PherbConsumer
                         continue;
                     }
 
-                    // Dispatch to whisper-worker (fire-and-forget) and ACK immediately
+                    // Dispatch first pipeline stage and HOLD the message (deferred ACK)
                     $this->dispatchJob($jobId, $audioPath, $options);
-                    $message->ack();
-                    $this->logDaemon("[{$jobId}] Dispatched whisper stage, ACKed JetStream");
+                    $this->activeMessages[$jobId] = $message;
+                    $this->logDaemon("[{$jobId}] Dispatched pipeline, holding JetStream message");
                 } catch (\Throwable $e) {
                     $this->logDaemon("[{$jobId}] Dispatch FAILED: " . $e->getMessage());
                     $this->jobStore->markFailed($jobId, "Dispatch: " . $e->getMessage());
@@ -670,15 +682,11 @@ class PherbConsumer
                 $this->recordActivity();
             }
 
-            // 3. Periodic stale job recovery + cleanup
+            // 4. Periodic housekeeping — purge old completed/failed jobs (DB + files)
             $now = time();
-            if (($now - $this->lastCleanupTime) >= ($this->cleanupIntervalMin * 60)) {
+            if (($now - $this->lastCleanupTime) >= 3600) {
                 $this->lastCleanupTime = $now;
                 try {
-                    $recovered = $this->recoverStaleJobsViaNats();
-                    if ($recovered > 0) {
-                        $this->logDaemon("Recovered {$recovered} stale processing job(s)");
-                    }
                     $deleted = $this->jobStore->cleanup($this->cleanupTtlDays, $this->outputPath);
                     if (!empty($deleted)) {
                         $this->logDaemon("Cleanup: purged " . count($deleted) . " expired jobs (TTL={$this->cleanupTtlDays}d)");
