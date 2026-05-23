@@ -6,17 +6,19 @@ const zio = @import("zio");
 
 const log = std.log.scoped(.pherb_worker);
 
-pub const version = "0.6.0";
+pub const version = "0.7.0";
 
 const subject_status = "pherb.worker.status";
 const subject_completed = "pherb.pipeline.completed";
 
 const max_stages = 16;
-const max_argv = 32;
+const max_argv = 64;
+const max_base_argv = 8;
 
 const StageEntry = struct {
     subject: []const u8,
-    command_template: []const u8,
+    base_argv: [max_base_argv][]const u8 = undefined,
+    base_argc: usize = 0,
 };
 
 const Config = struct {
@@ -57,11 +59,21 @@ const Config = struct {
                     log.warn("max stages ({d}) reached, ignoring: {s}", .{ max_stages, key });
                     continue;
                 }
-                config.stages[config.stage_count] = StageEntry{
+                var entry = StageEntry{
                     .subject = try allocator.dupe(u8, key),
-                    .command_template = try allocator.dupe(u8, val),
                 };
-                config.stage_count += 1;
+                // Split config value into base argv tokens (binary + fixed args)
+                var tok_iter = std.mem.splitScalar(u8, val, ' ');
+                while (tok_iter.next()) |tok| {
+                    if (tok.len == 0) continue;
+                    if (entry.base_argc >= max_base_argv) break;
+                    entry.base_argv[entry.base_argc] = try allocator.dupe(u8, tok);
+                    entry.base_argc += 1;
+                }
+                if (entry.base_argc > 0) {
+                    config.stages[config.stage_count] = entry;
+                    config.stage_count += 1;
+                }
             } else {
                 if (std.mem.eql(u8, key, "nats_url")) {
                     config.nats_url = try allocator.dupe(u8, val);
@@ -78,10 +90,10 @@ const Config = struct {
         return config;
     }
 
-    fn findCommand(self: *const Config, subject: []const u8) ?[]const u8 {
+    fn findStage(self: *const Config, subject: []const u8) ?StageEntry {
         for (self.stages[0..self.stage_count]) |entry| {
             if (entry) |e| {
-                if (std.mem.eql(u8, e.subject, subject)) return e.command_template;
+                if (std.mem.eql(u8, e.subject, subject)) return e;
             }
         }
         return null;
@@ -94,6 +106,7 @@ const ActiveJob = struct {
     job_id: []const u8,
     stage_name: []const u8,
     output_path: []const u8,
+    post_rename: ?[]const u8 = null,
 };
 
 pub fn main() !void {
@@ -126,7 +139,9 @@ pub fn main() !void {
     log.info("stages: {d} configured", .{config.stage_count});
     for (config.stages[0..config.stage_count]) |entry| {
         if (entry) |e| {
-            log.info("  {s} → {s}", .{ e.subject, e.command_template });
+            if (e.base_argc > 0) {
+                log.info("  {s} → {s}", .{ e.subject, e.base_argv[0] });
+            }
         }
     }
 
@@ -191,12 +206,12 @@ pub fn main() !void {
             continue;
         }
 
-        // Look up command for this subject — ignore unconfigured subjects
-        const command_template = config.findCommand(msg.subject) orelse {
+        // Look up stage for this subject — ignore unconfigured subjects
+        const stage = config.findStage(msg.subject) orelse {
             continue;
         };
 
-        active_job = spawnCommand(allocator, &conn, kq, msg, command_template) catch |err| {
+        active_job = spawnJob(allocator, &conn, kq, msg, &stage) catch |err| {
             log.err("spawn failed: {}", .{err});
             continue;
         };
@@ -226,6 +241,20 @@ fn checkChildExit(kq: i32, allocator: std.mem.Allocator, conn: *nats.Connection,
         const err_detail = std.fmt.bufPrint(&err_buf, "{s} exit {d}", .{ job.stage_name, exit_code }) catch "process failed";
         publishFailed(conn, job.job_id, job.stage_name, err_detail);
     } else {
+        // Post-rename: move produced file to output_path if specified
+        if (job.post_rename) |rename_from| {
+            const from_z = allocator.dupeZ(u8, rename_from) catch null;
+            const to_z = allocator.dupeZ(u8, job.output_path) catch null;
+            if (from_z != null and to_z != null) {
+                const result = std.c.rename(from_z.?, to_z.?);
+                if (result != 0) {
+                    log.err("[{s}] post_rename failed: {s} → {s}", .{ job.job_id, rename_from, job.output_path });
+                }
+                allocator.free(from_z.?);
+                allocator.free(to_z.?);
+            }
+        }
+
         log.info("[{s}] {s} done, output at {s}", .{ job.job_id, job.stage_name, job.output_path });
 
         var evt_buf: [768]u8 = undefined;
@@ -242,6 +271,7 @@ fn checkChildExit(kq: i32, allocator: std.mem.Allocator, conn: *nats.Connection,
     allocator.free(job.job_id);
     allocator.free(job.stage_name);
     allocator.free(job.output_path);
+    if (job.post_rename) |pr| allocator.free(pr);
     return true;
 }
 
@@ -266,13 +296,13 @@ fn replyBusy(conn: *nats.Connection, job: *const ActiveJob) void {
     log.info("busy ({s}), active job {s}", .{ job.stage_name, job.job_id });
 }
 
-/// Spawn a command from the template, expanding variables from the NATS payload.
-fn spawnCommand(
+/// Spawn a job: config provides base argv (binary), payload provides args array.
+fn spawnJob(
     allocator: std.mem.Allocator,
     conn: *nats.Connection,
     kq: i32,
     msg: *nats.Message,
-    command_template: []const u8,
+    stage: *const StageEntry,
 ) !?ActiveJob {
     const data = msg.data;
     if (data.len == 0) {
@@ -289,14 +319,11 @@ fn spawnCommand(
 
     const root = parsed.value.object;
     const job_id_raw = getStr(root, "job_id") orelse "unknown";
-    const audio_path = getStr(root, "audio_path") orelse {
-        log.err("[{s}] missing audio_path in payload", .{job_id_raw});
-        return null;
-    };
     const output_path_raw = getStr(root, "output_path") orelse {
         log.err("[{s}] missing output_path in payload", .{job_id_raw});
         return null;
     };
+    const post_rename_raw = getStr(root, "post_rename");
 
     // Derive stage name from subject (last segment after '.')
     const stage_name_raw = blk: {
@@ -313,35 +340,43 @@ fn spawnCommand(
     errdefer allocator.free(output_path);
     const stage_name = try allocator.dupe(u8, stage_name_raw);
     errdefer allocator.free(stage_name);
+    const post_rename: ?[]const u8 = if (post_rename_raw) |pr| try allocator.dupe(u8, pr) else null;
+    errdefer if (post_rename) |pr| allocator.free(pr);
 
-    log.info("[{s}] {s}: {s} → {s}", .{ job_id, stage_name, audio_path, output_path });
+    log.info("[{s}] {s}: → {s}", .{ job_id, stage_name, output_path });
 
-    // Expand template variables and split into argv
+    // Build argv: base_argv from config + args array from payload
     var argv_buf: [max_argv][]const u8 = undefined;
     var argc: usize = 0;
-    var alloc_tracker: [max_argv]bool = .{false} ** max_argv;
 
-    var token_iter = std.mem.splitScalar(u8, command_template, ' ');
-    while (token_iter.next()) |token| {
-        if (token.len == 0) continue;
+    // Copy base argv from config (not allocated — config owns these)
+    for (stage.base_argv[0..stage.base_argc]) |base_arg| {
         if (argc >= max_argv) break;
-
-        const expanded = expandVar(allocator, token, job_id, audio_path, output_path_raw) catch |err| {
-            log.err("[{s}] template expansion failed: {}", .{ job_id, err });
-            // Free any previously allocated argv entries
-            for (argv_buf[0..argc], alloc_tracker[0..argc]) |arg, was_alloc| {
-                if (was_alloc) allocator.free(arg);
-            }
-            publishFailed(conn, job_id, stage_name, "template expansion failed");
-            return null;
-        };
-        argv_buf[argc] = expanded.str;
-        alloc_tracker[argc] = expanded.allocated;
+        argv_buf[argc] = base_arg;
         argc += 1;
     }
 
+    // Append args from payload JSON array
+    if (root.get("args")) |args_val| {
+        switch (args_val) {
+            .array => |arr| {
+                for (arr.items) |item| {
+                    if (argc >= max_argv) break;
+                    switch (item) {
+                        .string => |s| {
+                            argv_buf[argc] = s;
+                            argc += 1;
+                        },
+                        else => {},
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+
     if (argc == 0) {
-        log.err("[{s}] empty command after expansion", .{job_id});
+        log.err("[{s}] empty command (no base argv)", .{job_id});
         publishFailed(conn, job_id, stage_name, "empty command");
         return null;
     }
@@ -356,16 +391,8 @@ fn spawnCommand(
     child.spawn() catch |err| {
         log.err("[{s}] spawn failed: {}", .{ job_id, err });
         publishFailed(conn, job_id, stage_name, "spawn failed");
-        for (argv_buf[0..argc], alloc_tracker[0..argc]) |arg, was_alloc| {
-            if (was_alloc) allocator.free(arg);
-        }
         return null;
     };
-
-    // Free expanded argv (child has inherited/copied the data)
-    for (argv_buf[0..argc], alloc_tracker[0..argc]) |arg, was_alloc| {
-        if (was_alloc) allocator.free(arg);
-    }
 
     const child_pid: posix.pid_t = @intCast(child.id);
     log.info("[{s}] spawned pid {d}", .{ job_id, child_pid });
@@ -388,94 +415,8 @@ fn spawnCommand(
         .job_id = job_id,
         .stage_name = stage_name,
         .output_path = output_path,
+        .post_rename = post_rename,
     };
-}
-
-const ExpandResult = struct {
-    str: []const u8,
-    allocated: bool,
-};
-
-/// Expand {audio_path}, {output_path}, {job_id} in a single token.
-fn expandVar(allocator: std.mem.Allocator, token: []const u8, job_id: []const u8, audio_path: []const u8, output_path: []const u8) !ExpandResult {
-    if (std.mem.eql(u8, token, "{audio_path}")) {
-        return .{ .str = audio_path, .allocated = false };
-    }
-    if (std.mem.eql(u8, token, "{output_path}")) {
-        return .{ .str = output_path, .allocated = false };
-    }
-    if (std.mem.eql(u8, token, "{job_id}")) {
-        return .{ .str = job_id, .allocated = false };
-    }
-    // Check for embedded variables (e.g., prefix{job_id}suffix)
-    if (std.mem.indexOf(u8, token, "{")) |_| {
-        // Calculate total size needed
-        var total_len: usize = 0;
-        var pos: usize = 0;
-        while (pos < token.len) {
-            if (token[pos] == '{') {
-                const end = std.mem.indexOfScalarPos(u8, token, pos, '}') orelse {
-                    total_len += 1;
-                    pos += 1;
-                    continue;
-                };
-                const var_name = token[pos + 1 .. end];
-                if (std.mem.eql(u8, var_name, "audio_path")) {
-                    total_len += audio_path.len;
-                } else if (std.mem.eql(u8, var_name, "output_path")) {
-                    total_len += output_path.len;
-                } else if (std.mem.eql(u8, var_name, "job_id")) {
-                    total_len += job_id.len;
-                } else {
-                    total_len += (end - pos + 1);
-                }
-                pos = end + 1;
-            } else {
-                total_len += 1;
-                pos += 1;
-            }
-        }
-
-        // Build the expanded string
-        const buf = try allocator.alloc(u8, total_len);
-        var write_pos: usize = 0;
-        pos = 0;
-        while (pos < token.len) {
-            if (token[pos] == '{') {
-                const end = std.mem.indexOfScalarPos(u8, token, pos, '}') orelse {
-                    buf[write_pos] = token[pos];
-                    write_pos += 1;
-                    pos += 1;
-                    continue;
-                };
-                const var_name = token[pos + 1 .. end];
-                const replacement: []const u8 = if (std.mem.eql(u8, var_name, "audio_path"))
-                    audio_path
-                else if (std.mem.eql(u8, var_name, "output_path"))
-                    output_path
-                else if (std.mem.eql(u8, var_name, "job_id"))
-                    job_id
-                else blk: {
-                    const literal = token[pos .. end + 1];
-                    @memcpy(buf[write_pos .. write_pos + literal.len], literal);
-                    write_pos += literal.len;
-                    pos = end + 1;
-                    break :blk "";
-                };
-                if (replacement.len > 0) {
-                    @memcpy(buf[write_pos .. write_pos + replacement.len], replacement);
-                    write_pos += replacement.len;
-                    pos = end + 1;
-                }
-            } else {
-                buf[write_pos] = token[pos];
-                write_pos += 1;
-                pos += 1;
-            }
-        }
-        return .{ .str = buf[0..write_pos], .allocated = true };
-    }
-    return .{ .str = token, .allocated = false };
 }
 
 /// Publish a failure event to the pipeline completion subject.

@@ -158,6 +158,9 @@ class PherbConsumer
         $opts = is_array($job['options']) ? $job['options'] : (json_decode($job['options'] ?? '{}', true) ?: []);
         $diarize = (bool)($opts['diarize'] ?? true);
         $align = (bool)($opts['align'] ?? false);
+        $model = $opts['model'] ?? 'medium.en';
+        $threads = (int)($opts['threads'] ?? 8);
+        $modelsDir = $opts['models_dir'] ?? '/models/whisper';
 
         // The converted WAV is the audio input for all subsequent stages
         $wavPath = $this->outputPath . "/{$jobId}.convert.wav";
@@ -165,8 +168,8 @@ class PherbConsumer
         switch ($completedStage) {
             case 'convert':
                 $whisperOutput = $this->outputPath . "/{$jobId}.whisper.json";
-                $this->logDaemon("[{$jobId}] Dispatching whisper stage");
-                $this->dispatcher->dispatchWhisper($jobId, $wavPath, $whisperOutput);
+                $this->logDaemon("[{$jobId}] Dispatching whisper stage (model={$model}, threads={$threads})");
+                $this->dispatcher->dispatchWhisper($jobId, $wavPath, $whisperOutput, $model, $modelsDir, $threads);
                 break;
 
             case 'whisper':

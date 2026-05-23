@@ -1,26 +1,26 @@
 # pherb-worker configuration
 #
 # The worker is a generic NATS-to-process bridge. It subscribes to the
-# subjects listed in [stages], runs the configured command when a message
+# subjects listed in [stages], spawns the configured binary when a message
 # arrives, and publishes a completion event when the process exits.
 #
 # Specify config file path with: pherb-worker -c /path/to/worker.conf
 # Default path: /usr/local/etc/pherb/worker.conf
 #
-# Template variables (expanded from the NATS JSON payload):
-#   {audio_path}  — input file path
-#   {output_path} — output file path (where the command must write its result)
-#   {job_id}      — job identifier
+# Each [stages] entry maps a NATS subject to a binary (+ optional fixed args).
+# The NATS payload provides the full argument list via an "args" JSON array.
+# The worker concatenates: <config binary + fixed args> + <payload args>
 #
-# The command MUST write its result to {output_path} and exit 0 on success.
+# Security: the config pins WHAT binary executes. The payload controls only
+# the arguments — it cannot change the binary or inject shell commands.
 
 # NATS server URL
 nats_url = nats://127.0.0.1:4222
 
-# Map NATS subjects to commands. Each line subscribes to that subject
-# and runs the command when a message is received.
+# Map NATS subjects to binaries. The value is split by spaces into the
+# base argv (binary path + any fixed arguments).
 [stages]
-# pherb.worker.convert = /usr/local/libexec/pherb/pherb-convert.sh {audio_path} {output_path} {job_id}
-# pherb.worker.whisper = /usr/local/libexec/pherb/pherb-whisper.sh {audio_path} {output_path} {job_id}
-# pherb.worker.pyannote = /usr/local/bin/python3 /usr/local/libexec/pherb/pherb-diarize.py {audio_path} {output_path}
-# pherb.worker.align = /usr/local/bin/python3 /usr/local/libexec/pherb/pherb-align.py {audio_path} {output_path}
+# pherb.worker.convert = /usr/local/bin/ffmpeg
+# pherb.worker.whisper = /usr/local/bin/whisper-cli
+# pherb.worker.pyannote = /usr/local/bin/python3.11 /usr/local/libexec/pherb/pherb-diarize.py
+# pherb.worker.align = /usr/local/bin/python3.11 /usr/local/libexec/pherb/pherb-align.py

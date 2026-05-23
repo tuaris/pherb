@@ -7,12 +7,13 @@ use Basis\Nats\Configuration as NatsConfiguration;
 /**
  * PipelineDispatcher — Fire-and-forget dispatch of pipeline stages via NATS.
  *
- * Publishes small control messages to pherb-worker. Does NOT wait for a reply.
- * The worker processes each stage independently and publishes completion events
- * to pherb.pipeline.completed, which the consumer listens for.
+ * Publishes control messages to pherb-worker with full argv arrays.
+ * The worker concatenates its configured binary path with the args array
+ * from the payload and spawns the process directly — no shell, no templates.
  *
- * The consumer (orchestrator) owns all paths. Every dispatch includes both
- * audio_path and output_path so workers never compute paths internally.
+ * The consumer (orchestrator) owns all paths and arguments. Every dispatch
+ * includes output_path and a complete args array so workers never compute
+ * paths or options internally.
  *
  * Subjects:
  *   pherb.worker.convert   — audio format conversion stage
@@ -33,49 +34,84 @@ class PipelineDispatcher
 
     /**
      * Dispatch audio conversion stage (ffmpeg → WAV).
+     *
+     * @param string $jobId      Job identifier
+     * @param string $audioPath  Input audio file path
+     * @param string $outputPath Desired output WAV path
      */
     public function dispatchConvert(string $jobId, string $audioPath, string $outputPath): void
     {
         $this->publish('pherb.worker.convert', [
             'job_id' => $jobId,
-            'audio_path' => $audioPath,
             'output_path' => $outputPath,
+            'args' => ['-y', '-i', $audioPath, '-ar', '16000', '-ac', '1', $outputPath],
         ]);
     }
 
     /**
      * Dispatch whisper transcription stage.
+     *
+     * @param string $jobId      Job identifier
+     * @param string $audioPath  Input WAV file path
+     * @param string $outputPath Desired output JSON path
+     * @param string $model      Whisper model name (e.g. "medium.en")
+     * @param string $modelsDir  Directory containing ggml-*.bin models
+     * @param int    $threads    Number of threads for inference
      */
-    public function dispatchWhisper(string $jobId, string $audioPath, string $outputPath): void
-    {
+    public function dispatchWhisper(
+        string $jobId,
+        string $audioPath,
+        string $outputPath,
+        string $model = 'medium.en',
+        string $modelsDir = '/models/whisper',
+        int $threads = 8,
+    ): void {
+        $modelPath = rtrim($modelsDir, '/') . "/ggml-{$model}.bin";
+        $tmpBase = dirname($outputPath) . "/.tmp_whisper_{$jobId}";
+
         $this->publish('pherb.worker.whisper', [
             'job_id' => $jobId,
-            'audio_path' => $audioPath,
             'output_path' => $outputPath,
+            'post_rename' => "{$tmpBase}.json",
+            'args' => [
+                '-m', $modelPath,
+                '-f', $audioPath,
+                '-t', (string)$threads,
+                '--output-json-full',
+                '-of', $tmpBase,
+            ],
         ]);
     }
 
     /**
      * Dispatch pyannote diarization stage.
+     *
+     * @param string $jobId      Job identifier
+     * @param string $audioPath  Input WAV file path
+     * @param string $outputPath Desired output JSON path
      */
     public function dispatchPyannote(string $jobId, string $audioPath, string $outputPath): void
     {
         $this->publish('pherb.worker.pyannote', [
             'job_id' => $jobId,
-            'audio_path' => $audioPath,
             'output_path' => $outputPath,
+            'args' => [$audioPath, $outputPath],
         ]);
     }
 
     /**
      * Dispatch wav2vec2 forced alignment stage.
+     *
+     * @param string $jobId      Job identifier
+     * @param string $audioPath  Input WAV file path
+     * @param string $outputPath Desired output JSON path
      */
     public function dispatchAlignment(string $jobId, string $audioPath, string $outputPath): void
     {
         $this->publish('pherb.worker.align', [
             'job_id' => $jobId,
-            'audio_path' => $audioPath,
             'output_path' => $outputPath,
+            'args' => [$audioPath, $outputPath],
         ]);
     }
 
