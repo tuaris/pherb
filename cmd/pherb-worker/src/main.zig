@@ -157,17 +157,18 @@ pub fn main() !void {
     defer conn.deinit();
 
     {
-        var backoff: u64 = 1;
+        var attempts: u32 = 0;
         while (true) {
             conn.connect(config.nats_url) catch |err| {
-                log.info("Connection failed: {}", .{err});
-                if (backoff >= 30) {
-                    log.err("NATS connect failed after retries, exiting", .{});
+                attempts += 1;
+                if (attempts >= 24) {
+                    log.err("NATS connect failed after {} attempts, exiting", .{attempts});
                     std.process.exit(1);
                 }
-                log.info("retrying in {}s...", .{backoff});
-                std.Thread.sleep(backoff * std.time.ns_per_s);
-                backoff = @min(backoff * 2, 30);
+                log.info("connect attempt {}/24 failed: {}, retrying in 5s...", .{ attempts, err });
+                std.Thread.sleep(5 * std.time.ns_per_s);
+                conn.deinit();
+                conn = nats.Connection.init(allocator, .{});
                 continue;
             };
             break;

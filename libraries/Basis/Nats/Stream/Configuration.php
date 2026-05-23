@@ -298,7 +298,9 @@ class Configuration
             'retention' => $this->getRetentionPolicy(),
             'storage' => $this->getStorageBackend(),
             'subjects' => $this->getSubjects(),
-            'consumer_limits' => $this->getConsumerLimits(),
+            'consumer_limits' => $this->getConsumerLimits() !== null
+                ? (object) $this->getConsumerLimits()
+                : null,
             'allow_msg_schedules' => $this->getAllowMsgSchedules(),
         ];
 
