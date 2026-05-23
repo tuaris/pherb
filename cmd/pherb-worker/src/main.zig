@@ -152,14 +152,27 @@ pub fn main() !void {
     const kq = try posix.kqueue();
     defer posix.close(kq);
 
-    // Connect to NATS
+    // Connect to NATS (retry with backoff for boot ordering)
     var conn = nats.Connection.init(allocator, .{});
     defer conn.deinit();
 
-    conn.connect(config.nats_url) catch |err| {
-        log.err("NATS connect failed: {}", .{err});
-        std.process.exit(1);
-    };
+    {
+        var backoff: u64 = 1;
+        while (true) {
+            conn.connect(config.nats_url) catch |err| {
+                log.info("Connection failed: {}", .{err});
+                if (backoff >= 30) {
+                    log.err("NATS connect failed after retries, exiting", .{});
+                    std.process.exit(1);
+                }
+                log.info("retrying in {}s...", .{backoff});
+                std.Thread.sleep(backoff * std.time.ns_per_s);
+                backoff = @min(backoff * 2, 30);
+                continue;
+            };
+            break;
+        }
+    }
 
     log.info("connected to NATS", .{});
 
