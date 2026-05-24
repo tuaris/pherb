@@ -106,7 +106,10 @@ const ActiveJob = struct {
     stage_name: []const u8,
     output_path: []const u8,
     post_rename: ?[]const u8 = null,
+    stderr_fd: ?posix.fd_t = null,
 };
+
+const max_stderr_bytes = 4096;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -243,10 +246,35 @@ fn checkChildExit(kq: i32, allocator: std.mem.Allocator, conn: *nats.Connection,
     // Reap the zombie
     _ = posix.waitpid(job.child_pid, 1);
 
+    // Read stderr output (available after child exit)
+    var stderr_output: []const u8 = "";
+    var stderr_alloc: ?[]u8 = null;
+    if (job.stderr_fd) |fd| {
+        var stderr_buf: [max_stderr_bytes]u8 = undefined;
+        var total: usize = 0;
+        while (total < max_stderr_bytes) {
+            const n_read = posix.read(fd, stderr_buf[total..]) catch break;
+            if (n_read == 0) break;
+            total += n_read;
+        }
+        posix.close(fd);
+        if (total > 0) {
+            stderr_alloc = allocator.dupe(u8, stderr_buf[0..total]) catch null;
+            if (stderr_alloc) |s| stderr_output = s;
+        }
+    }
+    defer if (stderr_alloc) |s| allocator.free(s);
+
     if (exit_code != 0) {
         log.err("[{s}] {s} exited with code {d}", .{ job.job_id, job.stage_name, exit_code });
-        var err_buf: [128]u8 = undefined;
-        const err_detail = std.fmt.bufPrint(&err_buf, "{s} exit {d}", .{ job.stage_name, exit_code }) catch "process failed";
+        if (stderr_output.len > 0) {
+            log.err("[{s}] stderr: {s}", .{ job.job_id, stderr_output });
+        }
+        var err_buf: [512]u8 = undefined;
+        const err_detail = if (stderr_output.len > 0)
+            std.fmt.bufPrint(&err_buf, "{s} exit {d}: {s}", .{ job.stage_name, exit_code, stderr_output[0..@min(stderr_output.len, 384)] }) catch "process failed"
+        else
+            std.fmt.bufPrint(&err_buf, "{s} exit {d}", .{ job.stage_name, exit_code }) catch "process failed";
         publishFailed(conn, job.job_id, job.stage_name, err_detail);
     } else {
         // Post-rename: move produced file to output_path if specified
@@ -372,7 +400,7 @@ fn spawnJob(
 
     // Spawn child process
     var child = std.process.Child.init(argv, allocator);
-    child.stderr_behavior = .Ignore;
+    child.stderr_behavior = .Pipe;
     child.stdout_behavior = .Ignore;
 
     child.spawn() catch |err| {
@@ -403,6 +431,7 @@ fn spawnJob(
         .stage_name = stage_name,
         .output_path = output_path,
         .post_rename = post_rename,
+        .stderr_fd = if (child.stderr) |s| s.handle else null,
     };
 }
 

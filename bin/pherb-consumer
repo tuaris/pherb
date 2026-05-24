@@ -40,10 +40,14 @@ class PherbConsumer
     private int $natsPort;
     private int $cleanupTtlDays;
     private ?IniConfig $settings;
+    private ?EnchiladaOTLP $otlp = null;
 
     /** @var array<string, object> JetStream messages held until pipeline completes */
     private array $activeMessages = [];
     private int $lastCleanupTime = 0;
+
+    /** @var array<string, float> Stage start timestamps for duration tracking */
+    private array $stageStartTimes = [];
 
     public function __construct(?IniConfig $settings = null)
     {
@@ -70,6 +74,26 @@ class PherbConsumer
             'health_file' => getenv('HEALTH_FILE') ?: '/var/run/pherb-consumer.health',
             'max_memory_mb' => (int)(getenv('MAX_MEMORY_MB') ?: 256),
         ]);
+
+        // Initialize OTLP telemetry (optional — disabled if endpoint is empty)
+        $otlpEndpoint = getenv('OTLP_ENDPOINT') ?: ($settings ? $settings->getString('otlp', 'endpoint', '') : '');
+        $otlpEnv = getenv('OTLP_ENVIRONMENT') ?: ($settings ? $settings->getString('otlp', 'environment', 'production') : 'production');
+        if (!empty($otlpEndpoint)) {
+            $this->otlp = new EnchiladaOTLP(
+                endpoint: $otlpEndpoint,
+                resource: [
+                    'service.name' => 'pherb-consumer',
+                    'service.namespace' => 'pherb',
+                    'deployment.environment' => $otlpEnv,
+                    'host.name' => gethostname() ?: 'unknown',
+                ],
+                scopeName: 'pherb.pipeline',
+                scopeVersion: '1.0.0',
+                batchSize: 5,
+                timeout: 3,
+                suppressErrors: true
+            );
+        }
     }
 
     /**
@@ -86,6 +110,16 @@ class PherbConsumer
         $convertOutput = $this->outputPath . "/{$jobId}.convert.wav";
         $this->logDaemon("[{$jobId}] Dispatching convert stage: {$audioPath}");
         $this->dispatcher->dispatchConvert($jobId, $fullPath, $convertOutput);
+
+        // Track pipeline start time and emit telemetry
+        $this->stageStartTimes["{$jobId}:pipeline"] = microtime(true);
+        $this->stageStartTimes["{$jobId}:convert"] = microtime(true);
+        $this->otlpEmit('Pipeline started', EnchiladaOTLP::SEVERITY_INFO, [
+            'job.id' => $jobId,
+            'job.audio_path' => $audioPath,
+            'job.stage' => 'convert',
+            'job.event' => 'pipeline.started',
+        ]);
     }
 
     /**
@@ -117,6 +151,18 @@ class PherbConsumer
             $this->logDaemon("[{$jobId}] Stage '{$stage}' failed: {$error}");
             $this->jobStore->markFailed($jobId, ucfirst($stage) . ": {$error}");
             $this->incrementMetric('errors');
+
+            $stageDuration = $this->popStageDuration($jobId, $stage);
+            $pipelineDuration = $this->popStageDuration($jobId, 'pipeline');
+            $this->otlpEmit('Stage failed', EnchiladaOTLP::SEVERITY_ERROR, [
+                'job.id' => $jobId,
+                'job.stage' => $stage,
+                'job.event' => 'stage.failed',
+                'job.error' => $error,
+                'job.stage_duration_ms' => $stageDuration,
+                'job.pipeline_duration_ms' => $pipelineDuration,
+            ]);
+
             $this->ackAndRelease($jobId, $completionMessage);
             return;
         }
@@ -128,6 +174,14 @@ class PherbConsumer
         }
 
         $this->logDaemon("[{$jobId}] Stage '{$stage}' completed, output at {$outputPath}");
+
+        $stageDuration = $this->popStageDuration($jobId, $stage);
+        $this->otlpEmit('Stage completed', EnchiladaOTLP::SEVERITY_INFO, [
+            'job.id' => $jobId,
+            'job.stage' => $stage,
+            'job.event' => 'stage.completed',
+            'job.stage_duration_ms' => $stageDuration,
+        ]);
 
         try {
             $this->advancePipeline($jobId, $stage, $outputPath);
@@ -193,6 +247,7 @@ class PherbConsumer
                 $whisperOutput = $this->outputPath . "/{$jobId}.whisper.json";
                 $this->logDaemon("[{$jobId}] Dispatching whisper stage (model={$model}, threads={$threads})");
                 $this->dispatcher->dispatchWhisper($jobId, $wavPath, $whisperOutput, $model, $modelsDir, $threads);
+                $this->stageStartTimes["{$jobId}:whisper"] = microtime(true);
                 break;
 
             case 'whisper':
@@ -200,10 +255,12 @@ class PherbConsumer
                     $pyannoteOutput = $this->outputPath . "/{$jobId}.pyannote.json";
                     $this->logDaemon("[{$jobId}] Dispatching pyannote stage");
                     $this->dispatcher->dispatchPyannote($jobId, $wavPath, $pyannoteOutput);
+                    $this->stageStartTimes["{$jobId}:pyannote"] = microtime(true);
                 } elseif ($align) {
                     $alignOutput = $this->outputPath . "/{$jobId}.align.json";
                     $this->logDaemon("[{$jobId}] Dispatching alignment stage");
                     $this->dispatcher->dispatchAlignment($jobId, $wavPath, $alignOutput);
+                    $this->stageStartTimes["{$jobId}:alignment"] = microtime(true);
                 } else {
                     $this->finalizePipeline($jobId);
                 }
@@ -214,6 +271,7 @@ class PherbConsumer
                     $alignOutput = $this->outputPath . "/{$jobId}.align.json";
                     $this->logDaemon("[{$jobId}] Dispatching alignment stage");
                     $this->dispatcher->dispatchAlignment($jobId, $wavPath, $alignOutput);
+                    $this->stageStartTimes["{$jobId}:alignment"] = microtime(true);
                 } else {
                     $this->finalizePipeline($jobId);
                 }
@@ -327,6 +385,18 @@ class PherbConsumer
         $this->jobStore->markCompleted($jobId, $outputFile);
         $this->incrementMetric('processed');
         echo "[" . date('H:i:s') . "] Job {$jobId} completed\n";
+
+        $pipelineDuration = $this->popStageDuration($jobId, 'pipeline');
+        $this->otlpEmit('Pipeline completed', EnchiladaOTLP::SEVERITY_INFO, [
+            'job.id' => $jobId,
+            'job.event' => 'pipeline.completed',
+            'job.pipeline_duration_ms' => $pipelineDuration,
+            'job.format' => $format,
+            'job.model' => $model,
+            'job.diarize' => $diarize,
+            'job.segments' => count($segments),
+            'job.duration_seconds' => $this->estimateDuration($segments),
+        ]);
 
         // ACK and release the held JetStream job message — pipeline complete
         if (isset($this->activeMessages[$jobId])) {
@@ -486,6 +556,31 @@ class PherbConsumer
         } else {
             $this->logDaemon("[{$job['id']}] Callback failed to {$url}: HTTP {$httpCode}");
         }
+    }
+
+    /**
+     * Emit an OTLP log record (no-op if OTLP is not configured).
+     */
+    private function otlpEmit(string $body, int $severity = EnchiladaOTLP::SEVERITY_INFO, array $attributes = []): void
+    {
+        if ($this->otlp !== null) {
+            $this->otlp->emit($body, $severity, $attributes);
+        }
+    }
+
+    /**
+     * Pop a stage start time and return the elapsed duration in milliseconds.
+     * Returns 0 if no start time was recorded.
+     */
+    private function popStageDuration(string $jobId, string $stage): int
+    {
+        $key = "{$jobId}:{$stage}";
+        if (!isset($this->stageStartTimes[$key])) {
+            return 0;
+        }
+        $elapsed = (microtime(true) - $this->stageStartTimes[$key]) * 1000;
+        unset($this->stageStartTimes[$key]);
+        return (int)round($elapsed);
     }
 
     /**
