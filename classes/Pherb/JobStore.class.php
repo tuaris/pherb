@@ -87,7 +87,7 @@ class JobStore
     public function markRetrying(string $id): int
     {
         $stmt = $this->db->prepare(
-            "UPDATE jobs SET status = 'processing', error_message = NULL, completed_at = NULL
+            "UPDATE jobs SET status = 'queued', error_message = NULL, completed_at = NULL
              WHERE id = :id AND status = 'failed'"
         );
         $stmt->execute(['id' => $id]);

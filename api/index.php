@@ -258,7 +258,7 @@ $api->post('/jobs/{id}/retry', function($req, $res) use ($jobStore, $natsHost, $
 
     $res->json([
         'job_id' => $id,
-        'status' => 'processing',
+        'status' => 'queued',
         'message' => 'Job retried, resuming from last completed stage',
         'nats_published' => $published,
     ]);
