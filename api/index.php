@@ -131,6 +131,14 @@ $api->post('/jobs', function($req, $res) use ($jobStore, $natsHost, $natsPort, $
     }
 
     $options = $body['options'] ?? [];
+
+    // Accept top-level convenience keys and merge into options
+    foreach (['model', 'diarize', 'align', 'format', 'threads'] as $key) {
+        if (isset($body[$key]) && !isset($options[$key])) {
+            $options[$key] = $body[$key];
+        }
+    }
+
     $callbackUrl = $body['callback_url'] ?? null;
 
     // Create job record
@@ -180,6 +188,7 @@ $api->get('/jobs/{id}', function($req, $res) use ($jobStore) {
     $response = [
         'job_id' => $job['id'],
         'status' => $job['status'],
+        'current_stage' => $job['current_stage'] ?? null,
         'audio_path' => $job['audio_path'],
         'created_at' => $job['created_at'],
         'started_at' => $job['started_at'],
@@ -200,6 +209,59 @@ $api->get('/jobs/{id}', function($req, $res) use ($jobStore) {
     }
 
     $res->json($response);
+});
+
+// Retry a failed job (resumes from last completed stage)
+$api->post('/jobs/{id}/retry', function($req, $res) use ($jobStore, $natsHost, $natsPort) {
+    $id = $req->getRouteParam('id');
+    $job = $jobStore->get($id);
+
+    if (!$job) {
+        $res->error('Job not found', 404);
+        return;
+    }
+
+    if ($job['status'] !== 'failed') {
+        $res->error('Only failed jobs can be retried', 409);
+        return;
+    }
+
+    $affected = $jobStore->markRetrying($id);
+    if ($affected === 0) {
+        $res->error('Job could not be retried', 500);
+        return;
+    }
+
+    // Re-publish to NATS — the consumer's dispatchJob will detect
+    // existing intermediate outputs and resume from the failed stage
+    $options = is_array($job['options']) ? $job['options'] : (json_decode($job['options'] ?? '{}', true) ?: []);
+    $published = false;
+    try {
+        $natsPayload = json_encode([
+            'job_id' => $id,
+            'audio_path' => $job['audio_path'],
+            'options' => $options,
+        ]);
+
+        $natsConfig = new \Basis\Nats\Configuration(
+            host: $natsHost,
+            port: (int)$natsPort,
+            timeout: 5.0,
+        );
+        $natsClient = new \Basis\Nats\Client($natsConfig);
+        $natsClient->publish('pherb.jobs.transcribe', $natsPayload);
+        $natsClient->disconnect();
+        $published = true;
+    } catch (\Throwable $e) {
+        // NATS publish failed
+    }
+
+    $res->json([
+        'job_id' => $id,
+        'status' => 'processing',
+        'message' => 'Job retried, resuming from last completed stage',
+        'nats_published' => $published,
+    ]);
 });
 
 // List recent jobs

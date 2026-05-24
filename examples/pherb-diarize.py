@@ -34,7 +34,7 @@ def main():
 
     from pyannote.audio import Pipeline
 
-    pipeline = Pipeline.from_pretrained(model_name, use_auth_token=hf_token)
+    pipeline = Pipeline.from_pretrained(model_name, token=hf_token)
 
     diarization = pipeline(audio_path)
 

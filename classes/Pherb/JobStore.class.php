@@ -69,6 +69,32 @@ class JobStore
     }
 
     /**
+     * Update the current pipeline stage for a job.
+     */
+    public function updateStage(string $id, string $stage): void
+    {
+        $stmt = $this->db->prepare(
+            "UPDATE jobs SET current_stage = :stage WHERE id = :id"
+        );
+        $stmt->execute(['id' => $id, 'stage' => $stage]);
+    }
+
+    /**
+     * Reset a failed job back to processing so it can be resumed.
+     *
+     * @return int Number of rows affected (0 if job was not in failed state)
+     */
+    public function markRetrying(string $id): int
+    {
+        $stmt = $this->db->prepare(
+            "UPDATE jobs SET status = 'processing', error_message = NULL, completed_at = NULL
+             WHERE id = :id AND status = 'failed'"
+        );
+        $stmt->execute(['id' => $id]);
+        return $stmt->rowCount();
+    }
+
+    /**
      * Mark a job as completed.
      */
     public function markCompleted(string $id, string $resultPath): void

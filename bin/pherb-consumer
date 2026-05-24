@@ -97,7 +97,13 @@ class PherbConsumer
     }
 
     /**
-     * Dispatch a new job — starts the pipeline at the convert stage.
+     * Dispatch a new job — starts or resumes the pipeline.
+     *
+     * Checks for existing intermediate stage outputs on disk.
+     * If found, resumes from the last completed stage instead of
+     * restarting from convert. This avoids re-running expensive
+     * stages (e.g., 40+ minute whisper inference) after a failure
+     * in a later stage.
      */
     private function dispatchJob(string $jobId, string $audioPath, array $options): void
     {
@@ -107,13 +113,45 @@ class PherbConsumer
             throw new \RuntimeException("Audio file not found: {$fullPath}");
         }
 
-        $convertOutput = $this->outputPath . "/{$jobId}.convert.wav";
-        $this->logDaemon("[{$jobId}] Dispatching convert stage: {$audioPath}");
-        $this->dispatcher->dispatchConvert($jobId, $fullPath, $convertOutput);
-
-        // Track pipeline start time and emit telemetry
+        // Track pipeline start time
         $this->stageStartTimes["{$jobId}:pipeline"] = microtime(true);
-        $this->stageStartTimes["{$jobId}:convert"] = microtime(true);
+
+        // Check for existing intermediate outputs to enable resume
+        $convertOutput = $this->outputPath . "/{$jobId}.convert.wav";
+        $whisperOutput = $this->outputPath . "/{$jobId}.whisper.json";
+        $pyannoteOutput = $this->outputPath . "/{$jobId}.pyannote.json";
+        $alignOutput = $this->outputPath . "/{$jobId}.align.json";
+
+        $opts = is_array($options) ? $options : [];
+        $diarize = (bool)($opts['diarize'] ?? true);
+        $align = (bool)($opts['align'] ?? false);
+
+        // Find the latest completed stage by checking outputs on disk
+        if (file_exists($pyannoteOutput) && filesize($pyannoteOutput) > 0) {
+            // Pyannote done — resume at alignment or finalize
+            if ($align && !file_exists($alignOutput)) {
+                $this->logDaemon("[{$jobId}] Resuming from pyannote (alignment pending)");
+                $this->advancePipeline($jobId, 'pyannote', $pyannoteOutput);
+            } else {
+                $this->logDaemon("[{$jobId}] All stages present, finalizing");
+                $this->finalizePipeline($jobId);
+            }
+        } elseif (file_exists($whisperOutput) && filesize($whisperOutput) > 0) {
+            // Whisper done — resume at pyannote (or alignment/finalize)
+            $this->logDaemon("[{$jobId}] Resuming from whisper (skipping convert+whisper)");
+            $this->advancePipeline($jobId, 'whisper', $whisperOutput);
+        } elseif (file_exists($convertOutput) && filesize($convertOutput) > 0) {
+            // Convert done — resume at whisper
+            $this->logDaemon("[{$jobId}] Resuming from convert (skipping convert)");
+            $this->advancePipeline($jobId, 'convert', $convertOutput);
+        } else {
+            // No intermediate outputs — start from scratch
+            $this->logDaemon("[{$jobId}] Dispatching convert stage: {$audioPath}");
+            $this->dispatcher->dispatchConvert($jobId, $fullPath, $convertOutput);
+            $this->jobStore->updateStage($jobId, 'convert');
+            $this->stageStartTimes["{$jobId}:convert"] = microtime(true);
+        }
+
         $this->otlpEmit('Pipeline started', EnchiladaOTLP::SEVERITY_INFO, [
             'job.id' => $jobId,
             'job.audio_path' => $audioPath,
@@ -247,6 +285,7 @@ class PherbConsumer
                 $whisperOutput = $this->outputPath . "/{$jobId}.whisper.json";
                 $this->logDaemon("[{$jobId}] Dispatching whisper stage (model={$model}, threads={$threads})");
                 $this->dispatcher->dispatchWhisper($jobId, $wavPath, $whisperOutput, $model, $modelsDir, $threads);
+                $this->jobStore->updateStage($jobId, 'whisper');
                 $this->stageStartTimes["{$jobId}:whisper"] = microtime(true);
                 break;
 
@@ -255,11 +294,13 @@ class PherbConsumer
                     $pyannoteOutput = $this->outputPath . "/{$jobId}.pyannote.json";
                     $this->logDaemon("[{$jobId}] Dispatching pyannote stage");
                     $this->dispatcher->dispatchPyannote($jobId, $wavPath, $pyannoteOutput);
+                    $this->jobStore->updateStage($jobId, 'pyannote');
                     $this->stageStartTimes["{$jobId}:pyannote"] = microtime(true);
                 } elseif ($align) {
                     $alignOutput = $this->outputPath . "/{$jobId}.align.json";
                     $this->logDaemon("[{$jobId}] Dispatching alignment stage");
                     $this->dispatcher->dispatchAlignment($jobId, $wavPath, $alignOutput);
+                    $this->jobStore->updateStage($jobId, 'alignment');
                     $this->stageStartTimes["{$jobId}:alignment"] = microtime(true);
                 } else {
                     $this->finalizePipeline($jobId);
@@ -271,6 +312,7 @@ class PherbConsumer
                     $alignOutput = $this->outputPath . "/{$jobId}.align.json";
                     $this->logDaemon("[{$jobId}] Dispatching alignment stage");
                     $this->dispatcher->dispatchAlignment($jobId, $wavPath, $alignOutput);
+                    $this->jobStore->updateStage($jobId, 'alignment');
                     $this->stageStartTimes["{$jobId}:alignment"] = microtime(true);
                 } else {
                     $this->finalizePipeline($jobId);
