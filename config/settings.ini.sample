@@ -23,3 +23,10 @@ output_path = /data/audio/outputs
 [cleanup]
 ; Delete completed/failed jobs older than this many days
 ttl_days = 7
+
+[otlp]
+; OTLP HTTP endpoint for log telemetry (empty = disabled)
+; Logs are sent as structured OTLP records with service.name=pherb-consumer
+endpoint = 
+; Environment label (production, staging, development)
+environment = production
