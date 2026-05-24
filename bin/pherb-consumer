@@ -89,7 +89,7 @@ class PherbConsumer
                 ],
                 scopeName: 'pherb.pipeline',
                 scopeVersion: '1.0.0',
-                batchSize: 5,
+                batchSize: 1,
                 timeout: 3,
                 suppressErrors: true
             );

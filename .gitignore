@@ -5,3 +5,4 @@ temp/
 .DS_Store
 cmd/pherb-worker/.zig-cache/
 cmd/pherb-worker/zig-out/
+*.core
