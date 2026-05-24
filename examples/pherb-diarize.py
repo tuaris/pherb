@@ -36,7 +36,13 @@ def main():
 
     pipeline = Pipeline.from_pretrained(model_name, token=hf_token)
 
-    diarization = pipeline(audio_path)
+    result = pipeline(audio_path)
+
+    # pyannote 4.x returns DiarizeOutput dataclass; 3.x returns Annotation directly
+    if hasattr(result, 'speaker_diarization'):
+        diarization = result.speaker_diarization
+    else:
+        diarization = result
 
     segments = []
     for turn, _, speaker in diarization.itertracks(yield_label=True):
