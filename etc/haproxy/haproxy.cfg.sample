@@ -54,6 +54,9 @@ backend be_pherb_api
     server pherb 127.0.0.1:8082 check inter 30s fall 3 rise 2
 
 # WebDAV file upload/download (Apache + mod_dav in webdav jail)
+# Strip /audio prefix — WebDAV Apache has DocumentRoot /data/audio,
+# so /audio/outputs/file.json must arrive as /outputs/file.json.
 backend be_webdav
+    http-request set-path %[path,regsub(^/audio,)]
     timeout server 600s
     server webdav 127.0.0.1:8081 check inter 30s fall 3 rise 2

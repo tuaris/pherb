@@ -107,6 +107,21 @@ ZFS dataset `models/audio` mounted at `/data/audio` (lz4 compression):
 
 nullfs-mounted into all worker jails (rw) and webdav (rw).
 
+Each jail that needs audio access must have `mount.fstab` set in its
+jail.conf.d entry:
+
+```sh
+# /etc/jail.conf.d/pherb.conf
+pherb { mount.fstab = /etc/fstab.pherb; }
+
+# /etc/fstab.pherb
+/data/audio /usr/local/jails/pherb/data/audio nullfs rw 0 0
+```
+
+Repeat for webdav, ffmpeg, pyannote, wav2vec2, and any other jails
+that run workers. Without `mount.fstab`, the nullfs entry in fstab
+will not be mounted when the jail starts.
+
 ## Configuration
 
 - **Worker**: `/usr/local/etc/pherb/worker.conf` (per-jail, defines stages)
