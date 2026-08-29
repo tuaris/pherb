@@ -1,8 +1,18 @@
+# Local configuration (secrets)
 config/settings.ini
 config/local.conf.php
+
+# Runtime artifacts
 temp/
 *.log
-.DS_Store
-cmd/pherb-worker/.zig-cache/
-cmd/pherb-worker/zig-out/
 *.core
+
+# Zig build outputs
+.zig-cache/
+zig-cache/
+zig-out/
+
+# Editor/OS cruft
+*~
+.*.sw?
+.DS_Store
