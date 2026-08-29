@@ -1,0 +1,80 @@
+#!/usr/local/bin/php
+<?php
+/**
+ * pherb-deliver — Artifact delivery handler (v1: noop + copy)
+ *
+ * Called by pherb-worker with two arguments:
+ *   $argv[1] = artifact path (absolute filesystem path)
+ *   $argv[2] = delivery config JSON (method, url, credentials_ref, etc.)
+ *
+ * Delivery methods:
+ *   noop — Do nothing. Artifact stays in place. Always succeeds.
+ *   copy — Copy artifact to a local destination path.
+ *
+ * Future methods (v2): sftp, webdav, s3, webhook
+ *
+ * Exit codes:
+ *   0 = success
+ *   1 = invalid arguments or config
+ *   2 = delivery failure (file not found, copy failed, etc.)
+ *
+ * @author Daniel Morante
+ * @copyright 2026 The Daniel Morante Company, Inc.
+ * @license BSD-2-Clause
+ */
+
+if ($argc < 3) {
+    fwrite(STDERR, "Usage: pherb-deliver <artifact_path> <delivery_config_json>\n");
+    exit(1);
+}
+
+$artifactPath = $argv[1];
+$configJson = $argv[2];
+
+$config = json_decode($configJson, true);
+if (!is_array($config) || empty($config['method'])) {
+    fwrite(STDERR, "Invalid delivery config: missing 'method'\n");
+    exit(1);
+}
+
+$method = $config['method'];
+
+switch ($method) {
+    case 'noop':
+        // No-op — artifact stays where it is
+        fwrite(STDOUT, "Delivery: noop (artifact at {$artifactPath})\n");
+        exit(0);
+
+    case 'copy':
+        $destination = $config['url'] ?? $config['path'] ?? '';
+        if (empty($destination)) {
+            fwrite(STDERR, "Delivery copy: missing 'url' or 'path' in config\n");
+            exit(1);
+        }
+
+        if (!file_exists($artifactPath)) {
+            fwrite(STDERR, "Delivery copy: artifact not found: {$artifactPath}\n");
+            exit(2);
+        }
+
+        // Ensure destination directory exists
+        $destDir = dirname($destination);
+        if (!is_dir($destDir)) {
+            if (!@mkdir($destDir, 0755, true)) {
+                fwrite(STDERR, "Delivery copy: cannot create directory: {$destDir}\n");
+                exit(2);
+            }
+        }
+
+        if (!@copy($artifactPath, $destination)) {
+            fwrite(STDERR, "Delivery copy: failed to copy {$artifactPath} → {$destination}\n");
+            exit(2);
+        }
+
+        fwrite(STDOUT, "Delivery: copied {$artifactPath} → {$destination}\n");
+        exit(0);
+
+    default:
+        fwrite(STDERR, "Delivery method '{$method}' not implemented (v1 supports: noop, copy)\n");
+        exit(1);
+}

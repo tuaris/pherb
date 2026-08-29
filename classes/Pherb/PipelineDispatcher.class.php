@@ -5,21 +5,22 @@ use Basis\Nats\Client as NatsClient;
 use Basis\Nats\Configuration as NatsConfiguration;
 
 /**
- * PipelineDispatcher — Fire-and-forget dispatch of pipeline stages via NATS.
+ * PipelineDispatcher — Durable dispatch of pipeline stages via NATS JetStream.
  *
- * Publishes control messages to pherb-worker with full argv arrays.
- * The worker concatenates its configured binary path with the args array
- * from the payload and spawns the process directly — no shell, no templates.
+ * Publishes control messages to JetStream subjects. Workers pull from durable
+ * consumers and compete for jobs. The worker concatenates its configured binary
+ * path with the args array from the payload and spawns the process directly.
  *
  * The consumer (orchestrator) owns all paths and arguments. Every dispatch
  * includes output_path and a complete args array so workers never compute
  * paths or options internally.
  *
- * Subjects:
- *   pherb.worker.convert   — audio format conversion stage
- *   pherb.worker.whisper   — transcription stage
- *   pherb.worker.pyannote  — speaker diarization stage
- *   pherb.worker.align     — forced alignment stage
+ * Subjects (captured by PHERB JetStream stream):
+ *   pherb.stage.convert   — audio format conversion stage
+ *   pherb.stage.whisper   — transcription stage
+ *   pherb.stage.pyannote  — speaker diarization stage
+ *   pherb.stage.align     — forced alignment stage
+ *   pherb.stage.deliver   — artifact delivery stage (optional)
  */
 class PipelineDispatcher
 {
@@ -41,7 +42,7 @@ class PipelineDispatcher
      */
     public function dispatchConvert(string $jobId, string $audioPath, string $outputPath): void
     {
-        $this->publish('pherb.worker.convert', [
+        $this->publish('pherb.stage.convert', [
             'job_id' => $jobId,
             'output_path' => $outputPath,
             'args' => ['-y', '-i', $audioPath, '-ar', '16000', '-ac', '1', $outputPath],
@@ -69,7 +70,7 @@ class PipelineDispatcher
         $modelPath = rtrim($modelsDir, '/') . "/ggml-{$model}.bin";
         $tmpBase = dirname($outputPath) . "/.tmp_whisper_{$jobId}";
 
-        $this->publish('pherb.worker.whisper', [
+        $this->publish('pherb.stage.whisper', [
             'job_id' => $jobId,
             'output_path' => $outputPath,
             'post_rename' => "{$tmpBase}.json",
@@ -92,7 +93,7 @@ class PipelineDispatcher
      */
     public function dispatchPyannote(string $jobId, string $audioPath, string $outputPath): void
     {
-        $this->publish('pherb.worker.pyannote', [
+        $this->publish('pherb.stage.pyannote', [
             'job_id' => $jobId,
             'output_path' => $outputPath,
             'args' => [$audioPath, $outputPath],
@@ -108,10 +109,26 @@ class PipelineDispatcher
      */
     public function dispatchAlignment(string $jobId, string $audioPath, string $outputPath): void
     {
-        $this->publish('pherb.worker.align', [
+        $this->publish('pherb.stage.align', [
             'job_id' => $jobId,
             'output_path' => $outputPath,
             'args' => [$audioPath, $outputPath],
+        ]);
+    }
+
+    /**
+     * Dispatch artifact delivery stage (optional).
+     *
+     * @param string $jobId        Job identifier
+     * @param string $artifactPath Path to the finalized artifact
+     * @param array  $delivery     Delivery config (method, url, credentials_ref, etc.)
+     */
+    public function dispatchDeliver(string $jobId, string $artifactPath, array $delivery): void
+    {
+        $this->publish('pherb.stage.deliver', [
+            'job_id' => $jobId,
+            'output_path' => $artifactPath,
+            'args' => [$artifactPath, json_encode($delivery)],
         ]);
     }
 

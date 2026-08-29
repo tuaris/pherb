@@ -1,15 +1,14 @@
 # pherb-worker configuration
 #
-# The worker is a generic NATS-to-process bridge. It subscribes to the
-# subjects listed in [stages], spawns the configured binary when a message
-# arrives, and publishes a completion event when the process exits.
+# The worker is a generic NATS-to-process bridge. It pulls messages from a
+# JetStream durable consumer, spawns the configured binary, sends inProgress
+# heartbeats while running, and publishes a completion event when done.
+#
+# Each worker instance handles ONE stage. Scale horizontally by running
+# multiple instances with the same consumer name (competing consumers).
 #
 # Specify config file path with: pherb-worker -c /path/to/worker.conf
 # Default path: /usr/local/etc/pherb/worker.conf
-#
-# Each [stages] entry maps a NATS subject to a binary (+ optional fixed args).
-# The NATS payload provides the full argument list via an "args" JSON array.
-# The worker concatenates: <config binary + fixed args> + <payload args>
 #
 # Security: the config pins WHAT binary executes. The payload controls only
 # the arguments — it cannot change the binary or inject shell commands.
@@ -17,10 +16,48 @@
 # NATS server URL
 nats_url = nats://127.0.0.1:4222
 
-# Map NATS subjects to binaries. The value is split by spaces into the
-# base argv (binary path + any fixed arguments).
-[stages]
-# pherb.worker.convert = /usr/local/bin/ffmpeg
-# pherb.worker.whisper = /usr/local/bin/whisper-cli
-# pherb.worker.pyannote = /usr/local/bin/python3.11 /usr/local/libexec/pherb/pherb-diarize.py
-# pherb.worker.align = /usr/local/bin/python3.11 /usr/local/libexec/pherb/pherb-align.py
+# JetStream stream name (must match consumer's stream config)
+# stream = PHERB
+
+# Stage configuration — one [stage] section per worker instance.
+# subject  = JetStream subject to pull from
+# consumer = Durable consumer name (shared across all workers for this stage)
+# command  = Binary path + optional fixed arguments (space-separated)
+# ack_wait = Max processing time in seconds before redelivery (default: 300)
+[stage]
+# subject = pherb.stage.convert
+# consumer = pherb-stage-convert
+# command = /usr/local/bin/ffmpeg
+# ack_wait = 60
+
+# --- Example configs for each stage ---
+#
+# Convert (fast — 60s ack_wait):
+#   subject = pherb.stage.convert
+#   consumer = pherb-stage-convert
+#   command = /usr/local/bin/ffmpeg
+#   ack_wait = 60
+#
+# Whisper (slow — 3600s ack_wait for long audio):
+#   subject = pherb.stage.whisper
+#   consumer = pherb-stage-whisper
+#   command = /usr/local/bin/whisper-cli
+#   ack_wait = 3600
+#
+# Pyannote (medium — 300s):
+#   subject = pherb.stage.pyannote
+#   consumer = pherb-stage-pyannote
+#   command = /usr/local/bin/python3.11 /usr/local/libexec/pherb/pherb-diarize.py
+#   ack_wait = 300
+#
+# Alignment (medium — 300s):
+#   subject = pherb.stage.align
+#   consumer = pherb-stage-align
+#   command = /usr/local/bin/python3.11 /usr/local/libexec/pherb/pherb-align.py
+#   ack_wait = 300
+#
+# Delivery (medium — 120s):
+#   subject = pherb.stage.deliver
+#   consumer = pherb-stage-deliver
+#   command = /usr/local/libexec/pherb/pherb-deliver
+#   ack_wait = 120

@@ -18,24 +18,29 @@ coordinates the pipeline via NATS messages.
 
 ## Architecture
 
-The worker is stage-agnostic. Each deployment instance subscribes to the
-NATS subjects defined in its `worker.conf` and runs the configured command.
-The consumer (orchestrator) owns all paths and pipeline logic.
+The worker is stage-agnostic — a generic NATS-to-process bridge. Each instance
+pulls from a single JetStream durable consumer and runs the configured command.
+Multiple workers for the same stage compete for jobs (load balancing). The
+consumer (orchestrator) owns all paths and pipeline logic.
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│ Consumer (orchestrator)                                          │
-│   - Owns all file paths                                          │
-│   - Dispatches stages with {audio_path, output_path, job_id}    │
-│   - Advances pipeline on completion events                       │
-│   - Merges + formats final output                                │
-└───────────┬──────────────┬──────────────┬──────────────┬────────┘
-            │              │              │              │
-    ┌───────▼──────┐ ┌────▼─────┐ ┌──────▼──────┐ ┌────▼────┐
-    │ convert      │ │ whisper  │ │ pyannote    │ │ align   │
-    │ worker       │ │ worker   │ │ worker      │ │ worker  │
-    │ (any jail)   │ │ (GPU host)│ │ (GPU jail)  │ │ (jail)  │
-    └──────────────┘ └──────────┘ └─────────────┘ └─────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│ Consumer (orchestrator)                                               │
+│   - Publishes stage messages to JetStream subjects                    │
+│   - Advances pipeline on completion events                            │
+│   - Merges + formats final output                                     │
+│   - Optionally dispatches delivery stage                              │
+└───────────┬──────────────┬──────────────┬──────────┬──────────┬──────┘
+            │              │              │          │          │
+    ┌───────▼──────┐ ┌────▼─────┐ ┌──────▼──────┐ ┌▼────────┐ ┌▼────────┐
+    │ convert      │ │ whisper  │ │ pyannote    │ │ align   │ │ deliver │
+    │ worker(s)    │ │ worker(s)│ │ worker(s)   │ │ worker  │ │ worker  │
+    │ (any host)   │ │ (GPU)    │ │ (GPU)       │ │ (CPU)   │ │ (CPU)   │
+    └──────────────┘ └──────────┘ └─────────────┘ └─────────┘ └─────────┘
+         ↑                ↑              ↑             ↑            ↑
+    Pull consumer    Pull consumer  Pull consumer Pull consumer Pull consumer
+    pherb-stage-     pherb-stage-   pherb-stage-  pherb-stage- pherb-stage-
+    convert          whisper        pyannote      align        deliver
 ```
 
 ## Jails
@@ -55,15 +60,30 @@ NFS-mounted shared storage.
 
 ## NATS Subjects
 
-| Subject | Type | Purpose |
-|---------|------|---------|
-| `pherb.jobs.transcribe` | JetStream (PHERB stream) | New job requests (API → consumer) |
-| `pherb.worker.convert` | Plain NATS | Consumer → worker: audio conversion |
-| `pherb.worker.whisper` | Plain NATS | Consumer → worker: transcription |
-| `pherb.worker.pyannote` | Plain NATS | Consumer → worker: speaker diarization |
-| `pherb.worker.align` | Plain NATS | Consumer → worker: forced alignment |
-| `pherb.pipeline.completed` | Plain NATS | Worker → consumer: stage completion |
-| `pherb.worker.status` | Plain NATS req/reply | Stale job detection |
+All subjects are captured by the PHERB JetStream stream. Workers use pull
+consumers for at-most-once delivery with competing consumer load balancing.
+
+| Subject | Purpose |
+|---------|---------|
+| `pherb.jobs.transcribe` | New job requests (API → consumer) |
+| `pherb.stage.convert` | Consumer → convert workers |
+| `pherb.stage.whisper` | Consumer → whisper workers |
+| `pherb.stage.pyannote` | Consumer → pyannote workers |
+| `pherb.stage.align` | Consumer → alignment workers |
+| `pherb.stage.deliver` | Consumer → delivery workers (optional) |
+| `pherb.pipeline.completed` | Worker → consumer: stage completion/failure |
+
+### Durable Consumers
+
+| Consumer Name | Filter Subject | Ack Wait | Purpose |
+|---|---|---|---|
+| `pherb-jobs` | `pherb.jobs.transcribe` | 120s | Orchestrator pulls new jobs |
+| `pherb-stage-convert` | `pherb.stage.convert` | 60s | Convert workers compete |
+| `pherb-stage-whisper` | `pherb.stage.whisper` | 3600s | Whisper workers compete |
+| `pherb-stage-pyannote` | `pherb.stage.pyannote` | 300s | Pyannote workers compete |
+| `pherb-stage-align` | `pherb.stage.align` | 300s | Alignment workers compete |
+| `pherb-stage-deliver` | `pherb.stage.deliver` | 120s | Delivery workers compete |
+| `pherb-pipeline` | `pherb.pipeline.completed` | 30s | Orchestrator processes completions |
 
 ## NATS Payload Contract
 
@@ -81,19 +101,23 @@ NFS-mounted shared storage.
 
 ```
 API POST /jobs → JetStream (pherb.jobs.transcribe)
-  → Consumer dispatches pherb.worker.convert
-    → Worker runs ffmpeg, writes .convert.wav
+  → Consumer dispatches pherb.stage.convert
+    → Worker pulls from pherb-stage-convert, runs ffmpeg, writes .convert.wav
     → Worker publishes pherb.pipeline.completed {stage: "convert"}
-  → Consumer dispatches pherb.worker.whisper
-    → Worker runs whisper-cli, writes .whisper.json
+  → Consumer dispatches pherb.stage.whisper
+    → Worker pulls from pherb-stage-whisper, runs whisper-cli, writes .whisper.json
     → Worker publishes pherb.pipeline.completed {stage: "whisper"}
-  → Consumer dispatches pherb.worker.pyannote (if diarize=true)
-    → Worker runs pyannote, writes .pyannote.json
+  → Consumer dispatches pherb.stage.pyannote (if diarize=true)
+    → Worker pulls from pherb-stage-pyannote, runs pyannote, writes .pyannote.json
     → Worker publishes pherb.pipeline.completed {stage: "pyannote"}
-  → Consumer dispatches pherb.worker.align (if align=true)
-    → Worker runs wav2vec2, writes .align.json
+  → Consumer dispatches pherb.stage.align (if align=true)
+    → Worker pulls from pherb-stage-align, runs wav2vec2, writes .align.json
     → Worker publishes pherb.pipeline.completed {stage: "alignment"}
-  → Consumer finalizes: merge outputs, format, write result, mark completed
+  → Consumer finalizes: merge outputs, format, write result
+  → Consumer dispatches pherb.stage.deliver (if delivery config present)
+    → Worker pulls from pherb-stage-deliver, routes artifact to destination
+    → Worker publishes pherb.pipeline.completed {stage: "deliver"}
+  → Consumer marks job completed
 ```
 
 ## Shared Storage
@@ -131,10 +155,13 @@ will not be mounted when the jail starts.
 ### Example worker.conf (pyannote jail)
 
 ```ini
-nats_url = nats://nats.freebsd-dev1.morante.com:4222
+nats_url = nats://nats.transcribe.morante.com:4222
 
-[stages]
-pherb.worker.pyannote = /usr/local/bin/python3 /usr/local/libexec/pherb/pherb-diarize.py {audio_path} {output_path}
+[stage]
+subject = pherb.stage.pyannote
+consumer = pherb-stage-pyannote
+command = /usr/local/bin/python3.11 /usr/local/libexec/pherb/pherb-diarize.py
+ack_wait = 300
 ```
 
 ## RC Services
@@ -201,8 +228,9 @@ must apply a REINPLACE_CMD to change `/../system` to `/system`.
 ### Worker not processing jobs
 
 1. Check NATS connectivity: `tail /var/log/pherb_worker.log`
-2. Verify subscription: look for `subscribed to pherb.worker.>`
-3. Check if worker is busy: `nats req pherb.worker.status ''` from nats jail
+2. Verify pull consumer: look for `pull consumer ready, waiting for jobs...`
+3. Check consumer pending: `nats consumer info PHERB pherb-stage-whisper`
+4. Check stream messages: `nats stream info PHERB`
 
 ### Consumer not advancing pipeline
 

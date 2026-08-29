@@ -3,27 +3,32 @@ const nats = @import("nats");
 const posix = std.posix;
 const c = std.c;
 const zio = @import("zio");
+const sdk = @import("opentelemetry-sdk");
+
+pub const std_options: std.Options = .{
+    .logFn = sdk.logs.std_log_bridge.logFn,
+};
 
 const log = std.log.scoped(.pherb_worker);
 
-pub const version = "0.7.0";
+pub const version = "0.8.0";
 
 const subject_completed = "pherb.pipeline.completed";
 
-const max_stages = 16;
 const max_argv = 64;
 const max_base_argv = 8;
-
-const StageEntry = struct {
-    subject: []const u8,
-    base_argv: [max_base_argv][]const u8 = undefined,
-    base_argc: usize = 0,
-};
+const max_stderr_bytes = 4096;
+const default_ack_wait_secs: u32 = 300;
+const default_stream = "PHERB";
 
 const Config = struct {
     nats_url: []const u8 = "nats://127.0.0.1:4222",
-    stages: [max_stages]?StageEntry = .{null} ** max_stages,
-    stage_count: usize = 0,
+    stream: []const u8 = default_stream,
+    subject: []const u8 = "",
+    consumer: []const u8 = "",
+    ack_wait: u32 = default_ack_wait_secs,
+    base_argv: [max_base_argv][]const u8 = undefined,
+    base_argc: usize = 0,
 
     fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !Config {
         var config = Config{};
@@ -36,7 +41,7 @@ const Config = struct {
         };
         defer allocator.free(content);
 
-        var in_stages = false;
+        var in_stage = false;
         var iter = std.mem.splitScalar(u8, content, '\n');
         while (iter.next()) |raw_line| {
             const line = std.mem.trim(u8, raw_line, &std.ascii.whitespace);
@@ -44,7 +49,7 @@ const Config = struct {
 
             // Section header
             if (line[0] == '[') {
-                in_stages = std.mem.eql(u8, line, "[stages]");
+                in_stage = std.mem.eql(u8, line, "[stage]");
                 continue;
             }
 
@@ -53,49 +58,47 @@ const Config = struct {
             const val = std.mem.trim(u8, line[eq + 1 ..], &std.ascii.whitespace);
             if (val.len == 0) continue;
 
-            if (in_stages) {
-                if (config.stage_count >= max_stages) {
-                    log.warn("max stages ({d}) reached, ignoring: {s}", .{ max_stages, key });
-                    continue;
-                }
-                var entry = StageEntry{
-                    .subject = try allocator.dupe(u8, key),
-                };
-                // Split config value into base argv tokens (binary + fixed args)
-                var tok_iter = std.mem.splitScalar(u8, val, ' ');
-                while (tok_iter.next()) |tok| {
-                    if (tok.len == 0) continue;
-                    if (entry.base_argc >= max_base_argv) break;
-                    entry.base_argv[entry.base_argc] = try allocator.dupe(u8, tok);
-                    entry.base_argc += 1;
-                }
-                if (entry.base_argc > 0) {
-                    config.stages[config.stage_count] = entry;
-                    config.stage_count += 1;
+            if (in_stage) {
+                if (std.mem.eql(u8, key, "subject")) {
+                    config.subject = try allocator.dupe(u8, val);
+                } else if (std.mem.eql(u8, key, "consumer")) {
+                    config.consumer = try allocator.dupe(u8, val);
+                } else if (std.mem.eql(u8, key, "ack_wait")) {
+                    config.ack_wait = std.fmt.parseInt(u32, val, 10) catch default_ack_wait_secs;
+                } else if (std.mem.eql(u8, key, "command")) {
+                    // Split command value into base argv tokens
+                    var tok_iter = std.mem.splitScalar(u8, val, ' ');
+                    while (tok_iter.next()) |tok| {
+                        if (tok.len == 0) continue;
+                        if (config.base_argc >= max_base_argv) break;
+                        config.base_argv[config.base_argc] = try allocator.dupe(u8, tok);
+                        config.base_argc += 1;
+                    }
                 }
             } else {
                 if (std.mem.eql(u8, key, "nats_url")) {
                     config.nats_url = try allocator.dupe(u8, val);
+                } else if (std.mem.eql(u8, key, "stream")) {
+                    config.stream = try allocator.dupe(u8, val);
                 }
             }
         }
 
-        if (config.stage_count == 0) {
-            log.err("no [stages] defined in config", .{});
+        if (config.subject.len == 0) {
+            log.err("missing 'subject' in [stage] section", .{});
+            std.process.exit(1);
+        }
+        if (config.consumer.len == 0) {
+            log.err("missing 'consumer' in [stage] section", .{});
+            std.process.exit(1);
+        }
+        if (config.base_argc == 0) {
+            log.err("missing 'command' in [stage] section", .{});
             std.process.exit(1);
         }
 
         log.info("loaded config from {s}", .{path});
         return config;
-    }
-
-    fn findStage(self: *const Config, subject: []const u8) ?StageEntry {
-        for (self.stages[0..self.stage_count]) |entry| {
-            if (entry) |e| {
-                if (std.mem.eql(u8, e.subject, subject)) return e;
-            }
-        }
-        return null;
     }
 };
 
@@ -108,8 +111,6 @@ const ActiveJob = struct {
     post_rename: ?[]const u8 = null,
     stderr_fd: ?posix.fd_t = null,
 };
-
-const max_stderr_bytes = 4096;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -138,14 +139,10 @@ pub fn main() !void {
 
     log.info("pherb-worker {s} starting", .{version});
     log.info("NATS: {s}", .{config.nats_url});
-    log.info("stages: {d} configured", .{config.stage_count});
-    for (config.stages[0..config.stage_count]) |entry| {
-        if (entry) |e| {
-            if (e.base_argc > 0) {
-                log.info("  {s} → {s}", .{ e.subject, e.base_argv[0] });
-            }
-        }
-    }
+    log.info("stream: {s}", .{config.stream});
+    log.info("stage: {s} → {s} (consumer={s}, ack_wait={d}s)", .{
+        config.subject, config.base_argv[0], config.consumer, config.ack_wait,
+    });
 
     // Initialize ZIO runtime (required by nats library — uses kqueue on FreeBSD)
     const rt = try zio.Runtime.init(allocator, .{});
@@ -180,269 +177,270 @@ pub fn main() !void {
 
     log.info("connected to NATS", .{});
 
-    // Subscribe to wildcard — single subscription handles all subjects.
-    // Command lookup filters to only configured stages.
-    const sub = conn.subscribeSync("pherb.worker.>") catch |err| {
-        log.err("subscribe failed: {}", .{err});
+    // Create JetStream context
+    const js = nats.JetStream.init(&conn, .{});
+
+    // Create pull subscription for this stage's durable consumer
+    const pull_sub = js.pullSubscribe(
+        config.subject,
+        config.consumer,
+        .{
+            .stream = config.stream,
+            .config = .{
+                .ack_wait = @as(u64, config.ack_wait) * std.time.ns_per_s,
+                .filter_subject = config.subject,
+            },
+        },
+    ) catch |err| {
+        log.err("pullSubscribe failed: {}", .{err});
         std.process.exit(1);
     };
-    defer sub.deinit();
+    defer pull_sub.deinit();
 
-    log.info("subscribed to pherb.worker.>, waiting for jobs...", .{});
+    log.info("pull consumer ready, waiting for jobs...", .{});
 
-    // Main loop — event-driven via kqueue for child exit, NATS for messages.
-    var active_job: ?ActiveJob = null;
+    // Heartbeat interval: send inProgress every ack_wait/3 seconds
+    const heartbeat_interval_ns: u64 = (@as(u64, config.ack_wait) / 3) * std.time.ns_per_s;
 
+    // Main loop — pull one job at a time, process it, ack, repeat.
     while (true) {
-        // Check kqueue for child exit event (non-blocking)
-        if (active_job) |*job| {
-            if (checkChildExit(kq, allocator, &conn, job)) {
-                active_job = null;
-            }
-        }
-
-        // Wait for NATS messages — short timeout if child is running, long if idle
-        const timeout: u64 = if (active_job != null) 100 else 30000;
-        var msg = sub.nextMsg(timeout) catch |err| {
+        // Pull a single message (blocking with 30s timeout)
+        var batch = pull_sub.fetch(1, 30000) catch |err| {
             if (err == error.Timeout) continue;
-            log.err("receive error: {}", .{err});
+            log.err("fetch error: {}", .{err});
+            std.Thread.sleep(1 * std.time.ns_per_s);
             continue;
         };
-        defer msg.deinit();
+        defer batch.deinit();
 
-        // Ignore messages while busy — worker processes one job at a time.
-        // The dispatching consumer holds the JetStream message and sends
-        // InProgress heartbeats; no busy reply needed.
-        if (active_job != null) {
+        if (batch.messages.len == 0) continue;
+
+        var js_msg = batch.messages[0];
+
+        // Parse payload from the JetStream message
+        const data = js_msg.msg.data;
+        if (data.len == 0) {
+            log.warn("empty message, acking and skipping", .{});
+            js_msg.ack() catch {};
             continue;
         }
 
-        // Look up stage for this subject — ignore unconfigured subjects
-        const stage = config.findStage(msg.subject) orelse {
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch {
+            log.err("invalid JSON payload, acking and skipping", .{});
+            js_msg.ack() catch {};
             continue;
         };
+        defer parsed.deinit();
 
-        active_job = spawnJob(allocator, &conn, kq, msg, &stage) catch |err| {
-            log.err("spawn failed: {}", .{err});
+        const root = parsed.value.object;
+        const job_id_raw = getStr(root, "job_id") orelse "unknown";
+        const output_path_raw = getStr(root, "output_path") orelse {
+            log.err("[{s}] missing output_path in payload", .{job_id_raw});
+            js_msg.ack() catch {};
             continue;
         };
-    }
-}
+        const post_rename_raw = getStr(root, "post_rename");
 
-/// Check kqueue for child exit event. Returns true if child exited.
-fn checkChildExit(kq: i32, allocator: std.mem.Allocator, conn: *nats.Connection, job: *ActiveJob) bool {
-    var events: [1]posix.Kevent = undefined;
-    const zero_timeout = posix.timespec{ .sec = 0, .nsec = 0 };
-    const n = posix.kevent(kq, &.{}, &events, &zero_timeout) catch |err| {
-        log.err("[{s}] kevent check failed: {}", .{ job.job_id, err });
-        return false;
-    };
-    if (n == 0) return false;
+        // Derive stage name from subject (last segment after '.')
+        const stage_name: []const u8 = blk: {
+            if (std.mem.lastIndexOfScalar(u8, config.subject, '.')) |idx| {
+                break :blk config.subject[idx + 1 ..];
+            }
+            break :blk config.subject;
+        };
 
-    // EVFILT_PROC event fired — child exited
-    const raw: u32 = @truncate(@as(u64, @bitCast(events[0].data)));
-    const exit_code: u32 = if (raw & 0x7f == 0) (raw >> 8) & 0xff else 255;
+        log.info("[{s}] {s}: → {s}", .{ job_id_raw, stage_name, output_path_raw });
 
-    // Reap the zombie
-    _ = posix.waitpid(job.child_pid, 1);
+        // Build argv: base_argv from config + args array from payload
+        var argv_buf: [max_argv][]const u8 = undefined;
+        var argc: usize = 0;
 
-    // Read stderr output (available after child exit)
-    var stderr_output: []const u8 = "";
-    var stderr_alloc: ?[]u8 = null;
-    if (job.stderr_fd) |fd| {
-        var stderr_buf: [max_stderr_bytes]u8 = undefined;
-        var total: usize = 0;
-        while (total < max_stderr_bytes) {
-            const n_read = posix.read(fd, stderr_buf[total..]) catch break;
-            if (n_read == 0) break;
-            total += n_read;
+        for (config.base_argv[0..config.base_argc]) |base_arg| {
+            if (argc >= max_argv) break;
+            argv_buf[argc] = base_arg;
+            argc += 1;
         }
-        posix.close(fd);
-        if (total > 0) {
-            stderr_alloc = allocator.dupe(u8, stderr_buf[0..total]) catch null;
-            if (stderr_alloc) |s| stderr_output = s;
-        }
-    }
-    defer if (stderr_alloc) |s| allocator.free(s);
 
-    if (exit_code != 0) {
-        log.err("[{s}] {s} exited with code {d}", .{ job.job_id, job.stage_name, exit_code });
-        if (stderr_output.len > 0) {
-            log.err("[{s}] stderr: {s}", .{ job.job_id, stderr_output });
-        }
-        var err_buf: [512]u8 = undefined;
-        const err_detail = if (stderr_output.len > 0)
-            std.fmt.bufPrint(&err_buf, "{s} exit {d}: {s}", .{ job.stage_name, exit_code, stderr_output[0..@min(stderr_output.len, 384)] }) catch "process failed"
-        else
-            std.fmt.bufPrint(&err_buf, "{s} exit {d}", .{ job.stage_name, exit_code }) catch "process failed";
-        publishFailed(conn, job.job_id, job.stage_name, err_detail);
-    } else {
-        // Post-rename: move produced file to output_path if specified
-        if (job.post_rename) |rename_from| {
-            const from_z = allocator.dupeZ(u8, rename_from) catch null;
-            const to_z = allocator.dupeZ(u8, job.output_path) catch null;
-            if (from_z != null and to_z != null) {
-                const result = std.c.rename(from_z.?, to_z.?);
-                if (result != 0) {
-                    log.err("[{s}] post_rename failed: {s} → {s}", .{ job.job_id, rename_from, job.output_path });
-                }
-                allocator.free(from_z.?);
-                allocator.free(to_z.?);
+        if (root.get("args")) |args_val| {
+            switch (args_val) {
+                .array => |arr| {
+                    for (arr.items) |item| {
+                        if (argc >= max_argv) break;
+                        switch (item) {
+                            .string => |s| {
+                                argv_buf[argc] = s;
+                                argc += 1;
+                            },
+                            else => {},
+                        }
+                    }
+                },
+                else => {},
             }
         }
 
-        log.info("[{s}] {s} done, output at {s}", .{ job.job_id, job.stage_name, job.output_path });
+        if (argc == 0) {
+            log.err("[{s}] empty command (no base argv)", .{job_id_raw});
+            publishEvent(&js, job_id_raw, stage_name, "failed", null, "empty command");
+            js_msg.ack() catch {};
+            continue;
+        }
 
-        var evt_buf: [768]u8 = undefined;
-        const evt = std.fmt.bufPrint(&evt_buf,
-            "{{\"job_id\":\"{s}\",\"stage\":\"{s}\",\"status\":\"completed\",\"output_path\":\"{s}\"}}",
-            .{ job.job_id, job.stage_name, job.output_path },
-        ) catch unreachable;
-        conn.publish(subject_completed, evt) catch |err| {
-            log.err("[{s}] failed to publish completion: {}", .{ job.job_id, err });
+        const argv = argv_buf[0..argc];
+
+        // Spawn child process
+        var child = std.process.Child.init(argv, allocator);
+        child.stderr_behavior = .Pipe;
+        child.stdout_behavior = .Ignore;
+
+        child.spawn() catch |err| {
+            log.err("[{s}] spawn failed: {}", .{ job_id_raw, err });
+            publishEvent(&js, job_id_raw, stage_name, "failed", null, "spawn failed");
+            js_msg.ack() catch {};
+            continue;
+        };
+
+        const child_pid: posix.pid_t = @intCast(child.id);
+        log.info("[{s}] spawned pid {d}", .{ job_id_raw, child_pid });
+
+        // Register for kqueue exit notification
+        const change = posix.Kevent{
+            .ident = @intCast(child_pid),
+            .filter = c.EVFILT.PROC,
+            .flags = c.EV.ADD | c.EV.ONESHOT,
+            .fflags = c.NOTE.EXIT,
+            .data = 0,
+            .udata = 0,
+        };
+        _ = posix.kevent(kq, &.{change}, &.{}, null) catch |err| {
+            log.err("[{s}] kevent register failed: {}", .{ job_id_raw, err });
+        };
+
+        // Wait for child exit with periodic inProgress heartbeats
+        var child_exited = false;
+        var last_heartbeat = std.time.nanoTimestamp();
+
+        while (!child_exited) {
+            // Non-blocking kqueue check for child exit
+            var events: [1]posix.Kevent = undefined;
+            const zero_timeout = posix.timespec{ .sec = 0, .nsec = 0 };
+            const n = posix.kevent(kq, &.{}, &events, &zero_timeout) catch 0;
+            if (n > 0) {
+                child_exited = true;
+                break;
+            }
+
+            // Send inProgress heartbeat if interval elapsed
+            const now = std.time.nanoTimestamp();
+            const elapsed: u64 = @intCast(now - last_heartbeat);
+            if (elapsed >= heartbeat_interval_ns) {
+                js_msg.inProgress() catch |err| {
+                    log.warn("[{s}] inProgress heartbeat failed: {}", .{ job_id_raw, err });
+                };
+                last_heartbeat = now;
+            }
+
+            // Sleep briefly to avoid busy-spinning
+            std.Thread.sleep(100 * std.time.ns_per_ms);
+        }
+
+        // Child exited — read exit code and stderr
+        var kq_events: [1]posix.Kevent = undefined;
+        const zero_ts = posix.timespec{ .sec = 0, .nsec = 0 };
+        _ = posix.kevent(kq, &.{}, &kq_events, &zero_ts) catch 0;
+
+        // Get exit status via waitpid
+        const wait_result = posix.waitpid(child_pid, 0);
+        const exit_code: u32 = if (wait_result.status & 0x7f == 0) (wait_result.status >> 8) & 0xff else 255;
+
+        // Read stderr
+        var stderr_output: []const u8 = "";
+        var stderr_alloc: ?[]u8 = null;
+        if (child.stderr) |stderr_stream| {
+            var stderr_buf: [max_stderr_bytes]u8 = undefined;
+            var total: usize = 0;
+            while (total < max_stderr_bytes) {
+                const n_read = posix.read(stderr_stream.handle, stderr_buf[total..]) catch break;
+                if (n_read == 0) break;
+                total += n_read;
+            }
+            posix.close(stderr_stream.handle);
+            if (total > 0) {
+                stderr_alloc = allocator.dupe(u8, stderr_buf[0..total]) catch null;
+                if (stderr_alloc) |s| stderr_output = s;
+            }
+        }
+        defer if (stderr_alloc) |s| allocator.free(s);
+
+        if (exit_code != 0) {
+            log.err("[{s}] {s} exited with code {d}", .{ job_id_raw, stage_name, exit_code });
+            if (stderr_output.len > 0) {
+                log.err("[{s}] stderr: {s}", .{ job_id_raw, stderr_output });
+            }
+            var err_buf: [512]u8 = undefined;
+            const err_detail = if (stderr_output.len > 0)
+                std.fmt.bufPrint(&err_buf, "{s} exit {d}: {s}", .{ stage_name, exit_code, stderr_output[0..@min(stderr_output.len, 384)] }) catch "process failed"
+            else
+                std.fmt.bufPrint(&err_buf, "{s} exit {d}", .{ stage_name, exit_code }) catch "process failed";
+            publishEvent(&js, job_id_raw, stage_name, "failed", null, err_detail);
+        } else {
+            // Post-rename: move produced file to output_path if specified
+            if (post_rename_raw) |rename_from| {
+                const from_z = allocator.dupeZ(u8, rename_from) catch null;
+                const to_z = allocator.dupeZ(u8, output_path_raw) catch null;
+                if (from_z != null and to_z != null) {
+                    const result = std.c.rename(from_z.?, to_z.?);
+                    if (result != 0) {
+                        log.err("[{s}] post_rename failed: {s} → {s}", .{ job_id_raw, rename_from, output_path_raw });
+                    }
+                    allocator.free(from_z.?);
+                    allocator.free(to_z.?);
+                }
+            }
+
+            log.info("[{s}] {s} done, output at {s}", .{ job_id_raw, stage_name, output_path_raw });
+            publishEvent(&js, job_id_raw, stage_name, "completed", output_path_raw, null);
+        }
+
+        // ACK the stage message — job processed (success or failure)
+        js_msg.ack() catch |err| {
+            log.err("[{s}] ack failed: {}", .{ job_id_raw, err });
         };
     }
-
-    // Free allocated resources
-    allocator.free(job.job_id);
-    allocator.free(job.stage_name);
-    allocator.free(job.output_path);
-    if (job.post_rename) |pr| allocator.free(pr);
-    return true;
 }
 
-/// Spawn a job: config provides base argv (binary), payload provides args array.
-fn spawnJob(
-    allocator: std.mem.Allocator,
-    conn: *nats.Connection,
-    kq: i32,
-    msg: *nats.Message,
-    stage: *const StageEntry,
-) !?ActiveJob {
-    const data = msg.data;
-    if (data.len == 0) {
-        log.warn("empty message, ignoring", .{});
-        return null;
+/// Publish a pipeline event (completion or failure) via JetStream.
+fn publishEvent(
+    js: *const nats.JetStream,
+    job_id: []const u8,
+    stage_name: []const u8,
+    status: []const u8,
+    output_path: ?[]const u8,
+    err_reason: ?[]const u8,
+) void {
+    var buf: [1024]u8 = undefined;
+    const evt = if (output_path) |op|
+        std.fmt.bufPrint(&buf,
+            "{{\"job_id\":\"{s}\",\"stage\":\"{s}\",\"status\":\"{s}\",\"output_path\":\"{s}\"}}",
+            .{ job_id, stage_name, status, op },
+        ) catch return
+    else if (err_reason) |reason|
+        std.fmt.bufPrint(&buf,
+            "{{\"job_id\":\"{s}\",\"stage\":\"{s}\",\"status\":\"{s}\",\"error\":\"{s}\"}}",
+            .{ job_id, stage_name, status, reason },
+        ) catch return
+    else
+        std.fmt.bufPrint(&buf,
+            "{{\"job_id\":\"{s}\",\"stage\":\"{s}\",\"status\":\"{s}\"}}",
+            .{ job_id, stage_name, status },
+        ) catch return;
+
+    const pub_result = js.publish(subject_completed, evt, .{});
+    if (pub_result) |ack| {
+        ack.deinit();
+    } else |err| {
+        log.err("[{s}] failed to publish {s} event: {}", .{ job_id, status, err });
     }
-
-    // Parse JSON payload
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch {
-        log.err("invalid JSON payload", .{});
-        return null;
-    };
-    defer parsed.deinit();
-
-    const root = parsed.value.object;
-    const job_id_raw = getStr(root, "job_id") orelse "unknown";
-    const output_path_raw = getStr(root, "output_path") orelse {
-        log.err("[{s}] missing output_path in payload", .{job_id_raw});
-        return null;
-    };
-    const post_rename_raw = getStr(root, "post_rename");
-
-    // Derive stage name from subject (last segment after '.')
-    const stage_name_raw = blk: {
-        if (std.mem.lastIndexOfScalar(u8, msg.subject, '.')) |idx| {
-            break :blk msg.subject[idx + 1 ..];
-        }
-        break :blk msg.subject;
-    };
-
-    // Dupe strings — they must outlive the message
-    const job_id = try allocator.dupe(u8, job_id_raw);
-    errdefer allocator.free(job_id);
-    const output_path = try allocator.dupe(u8, output_path_raw);
-    errdefer allocator.free(output_path);
-    const stage_name = try allocator.dupe(u8, stage_name_raw);
-    errdefer allocator.free(stage_name);
-    const post_rename: ?[]const u8 = if (post_rename_raw) |pr| try allocator.dupe(u8, pr) else null;
-    errdefer if (post_rename) |pr| allocator.free(pr);
-
-    log.info("[{s}] {s}: → {s}", .{ job_id, stage_name, output_path });
-
-    // Build argv: base_argv from config + args array from payload
-    var argv_buf: [max_argv][]const u8 = undefined;
-    var argc: usize = 0;
-
-    // Copy base argv from config (not allocated — config owns these)
-    for (stage.base_argv[0..stage.base_argc]) |base_arg| {
-        if (argc >= max_argv) break;
-        argv_buf[argc] = base_arg;
-        argc += 1;
-    }
-
-    // Append args from payload JSON array
-    if (root.get("args")) |args_val| {
-        switch (args_val) {
-            .array => |arr| {
-                for (arr.items) |item| {
-                    if (argc >= max_argv) break;
-                    switch (item) {
-                        .string => |s| {
-                            argv_buf[argc] = s;
-                            argc += 1;
-                        },
-                        else => {},
-                    }
-                }
-            },
-            else => {},
-        }
-    }
-
-    if (argc == 0) {
-        log.err("[{s}] empty command (no base argv)", .{job_id});
-        publishFailed(conn, job_id, stage_name, "empty command");
-        return null;
-    }
-
-    const argv = argv_buf[0..argc];
-
-    // Spawn child process
-    var child = std.process.Child.init(argv, allocator);
-    child.stderr_behavior = .Pipe;
-    child.stdout_behavior = .Ignore;
-
-    child.spawn() catch |err| {
-        log.err("[{s}] spawn failed: {}", .{ job_id, err });
-        publishFailed(conn, job_id, stage_name, "spawn failed");
-        return null;
-    };
-
-    const child_pid: posix.pid_t = @intCast(child.id);
-    log.info("[{s}] spawned pid {d}", .{ job_id, child_pid });
-
-    // Register for kqueue exit notification
-    const change = posix.Kevent{
-        .ident = @intCast(child_pid),
-        .filter = c.EVFILT.PROC,
-        .flags = c.EV.ADD | c.EV.ONESHOT,
-        .fflags = c.NOTE.EXIT,
-        .data = 0,
-        .udata = 0,
-    };
-    _ = posix.kevent(kq, &.{change}, &.{}, null) catch |err| {
-        log.err("[{s}] kevent register failed: {}", .{ job_id, err });
-    };
-
-    return ActiveJob{
-        .child_pid = child_pid,
-        .job_id = job_id,
-        .stage_name = stage_name,
-        .output_path = output_path,
-        .post_rename = post_rename,
-        .stderr_fd = if (child.stderr) |s| s.handle else null,
-    };
-}
-
-/// Publish a failure event to the pipeline completion subject.
-fn publishFailed(conn: *nats.Connection, job_id: []const u8, stage_name: []const u8, reason: []const u8) void {
-    var buf: [768]u8 = undefined;
-    const evt = std.fmt.bufPrint(&buf,
-        "{{\"job_id\":\"{s}\",\"stage\":\"{s}\",\"status\":\"failed\",\"error\":\"{s}\"}}",
-        .{ job_id, stage_name, reason },
-    ) catch return;
-    conn.publish(subject_completed, evt) catch {};
 }
 
 fn getStr(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
