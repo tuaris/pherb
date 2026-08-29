@@ -14,6 +14,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const otel_dep = b.dependency("opentelemetry", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     const exe = b.addExecutable(.{
         .name = "pherb-worker",
         .root_module = b.createModule(.{
@@ -23,6 +28,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "nats", .module = nats_dep.module("nats") },
                 .{ .name = "zio", .module = zio_dep.module("zio") },
+                .{ .name = "opentelemetry-sdk", .module = otel_dep.module("sdk") },
             },
         }),
     });

@@ -4,8 +4,12 @@
     .fingerprint = 0x353034d8a98628a4,
     .dependencies = .{
         .nats = .{
-            .url = "https://github.com/lalinsky/nats.zig/archive/refs/heads/main.tar.gz",
-            .hash = "1220643a62efb98d5c7e18c92cf83b0a8146460e9cf755ed795a900db297e6a9a4b9",
+            .url = "https://github.com/lalinsky/nats.zig/archive/c7eb72dbdbf5e71c453c22b66a29356d0e6d2ad4.tar.gz",
+            .hash = "nats-0.0.0-JvIiUNy6BgBkOmLvuY1cfhjJLPg7CoFGRg6c91XteVqQ",
+        },
+        .opentelemetry = .{
+            .url = "git+https://github.com/tuaris/opentelemetry-sdk?ref=freebsd-system-protoc#8aa960a514e1f2863659251cb0cf4de4de948fe0",
+            .hash = "opentelemetry-0.0.1-U_uKJy5JDwB3igxXw7o_Tj203IAa0NRFoTqcU9vIN4FR",
         },
     },
     .paths = .{
